@@ -58,6 +58,14 @@ Newest entries at the bottom.
 - **Open:** GitHub CLI (`gh`) is not installed on this machine; local commit exists, remote not created.
 - **Next:** Install GitHub CLI, then `gh repo create iisc-rbc-tracking --private --source=. --remote=origin --push`. Overlay review for the lumen mask; other person clones and copies the AVI locally.
 
+## 2026-10-05 — Private GitHub remote
+
+- **Done:** Installed GitHub CLI; created private repo and pushed `master`. URL: https://github.com/Sai2125/iisc-rbc-tracking . No AVI in `git ls-files`.
+- **Evidence:** none (infra)
+- **Open:** Collaborator needs repo access + local AVI copy.
+- **Next:** Overlay review for the lumen mask.
+
+
 
 
 

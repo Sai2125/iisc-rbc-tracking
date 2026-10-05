@@ -6,7 +6,7 @@ Updated: 2026-10-05
 
 First **tube/lumen mask** exists on one unannotated AVI frame. Bath is excluded. Ready to review the overlay, then next would be cell detection *inside* that mask.
 
-Repo sharing is in place locally: git initialized, AVI gitignored, `AGENTS.md` is the harness-agnostic rule file, `scripts/sync.ps1` / `sync.sh` for pull and lab-only push. **Private GitHub remote not created yet** (`gh` is not installed).
+Repo sharing is live: private GitHub [Sai2125/iisc-rbc-tracking](https://github.com/Sai2125/iisc-rbc-tracking). AVI is gitignored. `AGENTS.md` is the harness-agnostic rule file. Use `scripts/sync.ps1 pull` / `push-lab`.
 
 ## Next
 

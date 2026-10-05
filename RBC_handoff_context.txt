@@ -1,0 +1,357 @@
+# Handoff: RBC video tracking and a minimal research workflow
+
+## 1. Who we are and what I need
+
+My younger brother and I are helping a PhD student with biological research. I want to guide my brother while we work on the project together. He can **write and debug Python independently**.
+
+The scientific goal is to **track red blood cells (RBCs) moving through a narrow tube/channel and measure their paths and speeds**.
+
+I want help with two connected things:
+
+1. **Understanding and solving the video-analysis problem:** inspect footage, create manageable samples, explore preprocessing, and choose a tracking method.
+2. **Building a minimal working system:** make it easy to collaborate and automatically retain experiment settings, code, results, and progress.
+
+**My priority is a small hands-on working setup—not a large research platform, exhaustive plan, or elaborate automation system.** Start with something that helps us understand the footage and run experiments. Expand only when needed.
+
+## 2. Existing data and work
+
+We currently have one recording, with more similarly structured recordings expected.
+
+The recording consists of:
+- `2A002 2_C001H001S0001.avi` — approximately **22.9 GB**
+- `2A002 2_C001H001S0001.cihx` — approximately **16.6 KB**
+- `2A002 2_C001H001S0001.mii` — approximately **1.14 KB**
+
+I initially described the companion extension as `.chx`; inspection confirmed it is **`.cihx`**.
+
+I downloaded the files into Colab, shared the notebook with my brother, and was also downloading the video locally. **The current availability of those files in a live Colab runtime has not been confirmed.**
+
+### Existing Colab notebook
+https://colab.research.google.com/drive/1epkoY7j97vmJCkGPlb95x1imhModxp04
+
+This notebook was inspected. It contains one cell that downloads the Drive folder using `gdown`, with saved output showing successful downloads. It contains **no preprocessing or tracking implementation**.
+
+### Source Drive folder
+https://drive.google.com/drive/folders/1ijf3dyApph1DYn682XGcN5Y5zrB3tt7-
+
+File IDs:
+- AVI: `18KAfDzgve-fP-uSwBISTZy4lC8keRZ5h`
+- CIHX: `1ZB8CWfPcnuwMElGKdDPdV7LnNhhggMMy`
+- MII: `1pDqaWW8a1n5_paGzYztzapeQLJ9kBAH6`
+
+Use these only if access is available. Do not substitute another recording or change permissions.
+
+## 3. What was verified from the companion files
+
+The previous agent downloaded and inspected the actual `.cihx` and `.mii` files, **but did not download or decode the full AVI**.
+
+| Property | What the metadata reports |
+|---|---|
+| Camera | Photron FASTCAM Mini UX100 type 200K-M-32G |
+| Image dimensions | 1280 × 480 |
+| Recording rate | 10,000 frames/second |
+| Total images | 37,274 |
+| AVI compression | MII describes it as uncompressed |
+| Export format | CIHX describes 8-bit monochrome |
+| Effective bit depth | Separate CIHX field reports 12 bits |
+| Prior processing | CIHX `applyImageProc` is `1` |
+
+If all 37,274 images are consecutive captures at 10,000 fps, they represent approximately **3.73 seconds of physical activity**. That is conditional on verifying the export mapping.
+
+The file size is consistent with 37,274 uncompressed 1280 × 480, 8-bit monochrome frames: approximately **22.9 GB of pixel data**.
+
+### Important unresolved metadata issues
+
+1. **Frame-range inconsistency:**
+   CIHX reports 37,274 total frames but also a saved range of **0–17,471**. The actual AVI must be checked against these values.
+
+2. **Two different rate fields:**
+   `recordInfo/recordRate = 10000`, corroborated by MII.
+   `deviceInfo/recordRate = 125` is a separate device-state field.
+   Do not use the latter—or AVI playback FPS—as acquisition timing without verification.
+
+3. **No verified physical calibration:**
+   CIHX has `sizeOfPixel = 1.0` with an **empty unit**. This is not a verified micrometres-per-pixel calibration.
+
+4. **Export fidelity:**
+   Do not assume an 8-bit AVI retains all 12-bit camera information or represents untouched acquisition data.
+
+Technical detail: the CIHX has a binary prefix; its XML starts at byte 292. A parser was written to extract the XML payload rather than treating the whole file as ordinary XML.
+
+## 4. What the footage looks like
+
+I supplied one screenshot and circled the target RBC in red.
+
+The agent visually inspected that image and observed:
+- A long, narrow tube/channel running diagonally across the frame.
+- Wider/tapered regions at its ends.
+- My indicated cell near the **right-hand widened end**.
+- Numerous other objects elsewhere in the field.
+- Strongly contrasted tube edges that could distract a tracker.
+
+I confirmed that **the cell passes through the tube**.
+
+However:
+- Actual flow direction has not been established.
+- The cell’s appearance inside the narrow section has not been observed by the agent.
+- Speed, deformation, wall stability, and visibility throughout transit remain unknown.
+- I am **not sure whether only one cell or several cells occupy the tube at a time**.
+
+The red circle is an annotation, not part of the experimental imagery. Use unannotated original frames for processing. Screenshot coordinates must not be assumed to match original AVI coordinates.
+
+## 5. Problem statement
+
+> Develop and validate a reproducible method to locate RBCs in high-speed microscopy recordings, maintain their identities across consecutive frames, and estimate their trajectories and speeds as they pass through a narrow tube/channel.
+
+Separate the problem into:
+1. **Preprocessing:** improve useful contrast without distorting measurements.
+2. **Detection/segmentation:** locate the cell in each frame.
+3. **Tracking:** associate the same cell across frames.
+4. **Measurement and validation:** calculate supported quantities and check whether the track is correct.
+
+The immediate engineering goal is:
+
+> Create a manageable, scientifically useful working sample and a simple experiment loop before processing entire recordings.
+
+**A large file on disk does not need to be loaded entirely into RAM.** Read frames incrementally.
+
+## 6. Agreed approach and constraints
+
+The agreed starting workflow is:
+
+**Inspect a sample → try preprocessing → test one understandable tracker → visually check results → save the experiment.**
+
+Prefer:
+- Colab as the initial workbench.
+- Short, **contiguous sequences** at original resolution and frame cadence.
+- A channel-focused region of interest where useful.
+- Simple classical methods before assuming deep learning is necessary.
+- Manual reference positions for a few trajectories.
+- Lightweight automatic run records.
+
+Avoid:
+- Blindly reducing resolution or skipping frames.
+- Using a lossy preview as scientific analysis data.
+- Choosing a final algorithm from one still image.
+- Reporting physical speed before timing and spatial calibration are verified.
+- Overwriting raw files or the existing download notebook.
+- Uploading research footage to additional AI providers or making data public without permission.
+
+## 7. Starter notebook already created
+
+A separate notebook, **`RBC_01_Inspect.ipynb`**, was generated and delivered.
+
+It does:
+- Explicit input-path and missing-file checks.
+- Optional Google Drive mounting.
+- CIHX/MII parsing and AVI metadata inspection.
+- A bounded partial video fingerprint—not a full 23 GB checksum.
+- Six original-resolution sample PNGs from different parts of the recording.
+- Pixel-exact PNG round-trip checks against decoded pixels.
+- A contact sheet.
+- An optional **200-frame contiguous H.264 viewing preview**, capped at 1,000 frames.
+- Per-run report, settings, code, package versions, and observations.
+- A downloadable results ZIP without the original AVI.
+
+It **does not implement preprocessing, tracking, or physical speed calculation**.
+
+### Validation status
+All notebook cells were executed successfully on **synthetic footage**. Actual companion-file parsing was tested. Tests covered sample indices, PNG fidelity, preview encoding, reruns, input preservation, and missing-file handling.
+
+**It has not been tested on the real AVI. I have not yet returned real-video notebook outputs in this conversation.**
+
+### Colab caveats
+- A new notebook may use a different runtime and not see files downloaded under `/content` in the original notebook.
+- Default input path:
+  `/content/RBC Videos Longevity India/2A002 2_C001H001S0001.avi`
+- No automatic 23 GB download is triggered.
+- Default outputs are temporary and must be downloaded before a runtime reset.
+- CPU is sufficient for the inspection notebook.
+- At a verified 10,000 fps with consecutive frames, 200 frames represent roughly **20 ms**, which may not cover a complete passage.
+
+### Artifact references
+Original thread:
+https://hyperagent.com/thread/cmto8agfm02c606addng411kh
+
+Starter notebook file ID:
+`cmto8rdaj01s707ad1ts6lr83`
+
+Annotated screenshot file ID:
+`cmto9mmw2021t07adez9a9e1t`
+
+Handwritten meeting-notes image:
+`cmto7xl8s01jd07adqbb6o5f6`
+
+Working context document:
+`cmto8ajqq01u607adhczspnye`
+
+These are platform-specific IDs. If you cannot access them, ask me to attach the files. Do not assume another agent shares the same filesystem.
+
+## 8. Tracking approaches discussed—not yet selected or validated
+
+### A. Click-initialized template matching
+Manually select the target cell once, then search for a similar image patch in nearby frames, constrained to the tube.
+
+Potential advantages:
+- Simple first experiment for one cell.
+- Avoids needing a perfect whole-image detector.
+
+Risks:
+- Cell deformation or contrast changes.
+- Drift.
+- Strong stationary wall edges dominating the match.
+
+### B. Detection plus centroid linking
+Candidate pipeline:
+
+**Channel mask → background correction if justified → cell detection → centroid positions → frame-to-frame linking**
+
+Start with simple linking; introduce motion prediction and consistent assignment if necessary.
+
+Risks:
+- Cell/wall confusion.
+- Overlaps.
+- Inconsistent segmentation as the cell changes shape.
+- Background subtraction suppressing stationary cells.
+
+### C. Tube-aligned kymograph
+Extract image intensity along a strip following the tube and stack it over time. A moving cell may create a trace whose position changes with time.
+
+Potential use:
+- Understand the passage visually.
+- Estimate along-channel motion.
+- Cross-check another tracker.
+
+Limitations:
+- Requires a distinguishable cell signal.
+- Multiple cells can produce ambiguous traces.
+- Does not by itself recover the full 2D trajectory.
+
+### D. Motion-aware/keyhole tracking
+Use recent movement to constrain likely next positions. Relevant if simple linking fails.
+
+### E. Existing tools
+Fiji/TrackMate can provide detection, linking, overlays, and manual correction:
+https://imagej.net/plugins/trackmate/
+
+Deep learning remains an option if simpler detection methods fail, but no need for it has been established.
+
+## 9. Research papers and code found
+
+### Recommended first paper
+**Kumar et al., 2020 — Automated Motion Tracking and Data Extraction for Red Blood Cell Biomechanics**
+https://doi.org/10.1002/cpcy.75
+
+Close match:
+- High-speed microscopy of RBCs in constricting microchannels.
+- 8-bit grayscale AVI.
+- Position, velocity, and morphology extraction.
+
+Workflow:
+**Background/static-object removal → filtering/contrast → channel ROI → segmentation → size filtering → tracking → export**
+
+Uses commercial **Image-Pro** and discusses Fiji alternatives. Read *Basic Protocol 1* and *Basic Protocol 2* first. Borrow the workflow, not the exact thresholds.
+
+### Relevant tracking-method paper
+**Automatic tracking and deformation measurements of red blood cells flowing through a microchannel with a microstenosis: the keyhole model — 2014**
+https://doi.org/10.1080/21681163.2014.957868
+
+Describes MATLAB-based RBC tracking and deformation measurement through a smooth contraction using the keyhole model.
+
+The abstract/method description was verified; **downloadable implementation was not verified**.
+
+### Public Python project
+**RBCZigZagAI**
+https://github.com/berndporr/RBCZigZagAI
+
+Companion paper:
+**Link et al., 2023 — AI based image analysis of red blood cells in oscillating microchannels**
+https://pubs.rsc.org/en/content/articlehtml/2023/ra/d3ra04644c
+
+Relevant files:
+- `framegenerator.py`: AVI reading and background calculation.
+- `celldetect.py`: cell detection at selected channel positions.
+- `imageobt.py`: extraction of relevant cell images.
+- `train.py`: classification model training/testing.
+
+The paper describes OpenCV background subtraction, localized detection windows, contour detection, and cropping.
+
+**Critical distinction:** Its final task is native-versus-chemically-modified RBC classification, **not complete identity-preserving trajectory/speed tracking**. Reported classification accuracy is not tracking accuracy.
+
+The repository and paper were reviewed at the description/method level. **The source implementation has not been thoroughly inspected or run.** Retrieved information described the repository as archived; verify its current status before reuse.
+
+### Reference dataset
+**RBCdataset**
+https://github.com/icimrak/RBCdataset
+
+Contains two partially annotated microfluidic cell-flow sequences, with bounding boxes and track identities.
+
+Useful for understanding annotations or testing algorithms. **It is a dataset, not a ready-made tracker**, and success on it does not establish success on our recording.
+
+## 10. AI tooling and collaboration preferences
+
+I am interested in a **third-party coding-agent harness**, rather than the conventional Claude Code or Codex setup.
+
+I already have some **Hugging Face credits** and want to explore using those before buying more credits or subscriptions. OpenRouter is another possibility I mentioned.
+
+However:
+- The type and eligible use of my HF credits have not been established.
+- No harness/provider compatibility or cost comparison has been completed.
+- No subscription or model choice has been made.
+- Coding assistance, model inference, and video-processing compute are separate concerns.
+- This tooling discussion was deliberately deferred until the basic experiment loop works.
+
+I want progress and experiments recorded with minimal manual effort, including:
+- Sample provenance and frame ranges.
+- Parameters and code versions.
+- Outputs and failure cases.
+- Brief observations and decisions.
+
+This should support reproducibility and potentially future publication, without pretending that good recordkeeping alone establishes scientific novelty or validity.
+
+## 11. Other meeting-note context
+
+My handwritten notes mentioned:
+- Reviewing existing processing approaches.
+- Starting with simple non-deep-learning algorithms.
+- Considering resource trade-offs and customization.
+- High-speed footage of cells passing through a channel.
+
+They also contained notes about plasma proteins, steady state, and secretion. **Their relationship to the RBC-tracking task was never clarified; do not assume they define the research objective.**
+
+## 12. Where to resume
+
+Do not restart with a large planning exercise or assume the tracking problem is already solved.
+
+The most useful next directions are:
+- Help us run the existing inspection notebook and review actual sample frames/preview.
+- Walk through the Kumar paper in plain language.
+- Inspect the Python preprocessing/detection code in RBCZigZagAI before adapting anything.
+- Then choose one small experiment around a complete cell passage and validate against manual reference positions.
+
+**Current status: metadata inspected, one annotated still viewed, an inspection notebook created and synthetically tested, relevant literature found. No real-video preprocessing or tracking has yet been validated.**
+
+---
+
+## Appendix: Local file map
+
+Snapshot time (local listing): 2026-09-16, folder `C:\Users\ASUS\Documents\IIsc`
+
+Directory listing (`Get-ChildItem -Force`):
+
+| Name | Bytes | LastWriteTime | Notes |
+|---|---|---|---|
+| `2A002 2_C001H001S0001-001.avi` | 22,901,777,870 | 2026-09-05 15:45:15 | Present. Name has `-001` before `.avi`; handoff expected `2A002 2_C001H001S0001.avi`. Size matches ~22.9 GB. |
+| `2A002 2_C001H001S0001.cihx` | 16,603 | 2026-09-16 19:22:29 | Present. Matches expected companion name (~16.6 KB). |
+| `2A002 2_C001H001S0001.mii` | 1,139 | 2026-09-16 19:22:31 | Present. Matches expected companion name (~1.14 KB). |
+| `Untitled24.ipynb` | 34,275 | 2026-09-16 19:42:13 | Present. Colab download cell (`gdown`) plus RBC 01 inspection cells. Default `VIDEO_PATH` still points at `/content/RBC Videos Longevity India/2A002 2_C001H001S0001.avi`. Inspection cells have no local execution outputs. |
+
+Not present in this folder:
+
+- `2A002 2_C001H001S0001.avi` (exact handoff filename; the local AVI is `2A002 2_C001H001S0001-001.avi`)
+- `RBC Videos Longevity India\` subdirectory
+- `RBC_01_Inspect.ipynb` as a separate filename (inspection content is inside `Untitled24.ipynb`)
+
+Workspace search (Cursor glob) previously missed the AVI and CIHX; they are on disk. The AVI is likely excluded from default indexing because of size.
+
+This appendix is a folder inventory only. No AVI decode, CIHX XML parse, or notebook run was performed for this snapshot.

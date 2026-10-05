@@ -1,0 +1,1 @@
+Methods and related-work prose are generated **on demand** into `writeup/draft.md` from `lab/` (see `AGENTS.md` and `.cursor/skills/rbc-writeup/`). There is no paper body here until someone asks for a draft.

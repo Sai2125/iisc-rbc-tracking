@@ -1,0 +1,11 @@
+Random AVI frame 24642 of 37274 (header count), seed 20260916.
+Unannotated grayscale still from 2A002 2_C001H001S0001-001.avi (not image (3).png).
+
+overlay.png: green = lumen mask, red = wall edges.
+walls.png / lumen_mask.png: binary.
+
+What works: both flares plus a continuous ribbon along the bore. Bath cells are excluded.
+
+Known leaks: dirt on the glass mid-tube adds small extra green/red blobs. Right-tip of the far flare is slightly underfilled. Narrow-bore mask is only a few pixels wide (expected).
+
+Prototype only. Not tracking. Full video was not scanned.

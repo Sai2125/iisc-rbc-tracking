@@ -1,0 +1,10 @@
+{
+  "video": "2A002 2_C001H001S0001-001.avi",
+  "avi_index_0based": 24642,
+  "avi_frame_count_header": 37274,
+  "rng_seed": 20260916,
+  "still": "probe_still.png",
+  "annotation": "none; decoded from AVI, not the red-circle screenshot",
+  "lumen_fraction": 0.0144970703125,
+  "wall_fraction": 0.016305338541666665
+}

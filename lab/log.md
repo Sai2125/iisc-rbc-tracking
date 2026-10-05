@@ -55,8 +55,8 @@ Newest entries at the bottom.
 
 - **Done:** Added `.gitignore` (AVI excluded), `README.md` system map, extended `AGENTS.md`, `scripts/sync.ps1` + `sync.sh`, Copilot/CLAUDE/Cline pointers, Cursor skills `rbc-git-sync` and `rbc-writeup`, `lab/related-work.md`, `writeup/README.md`. Tube-mask code unchanged.
 - **Evidence:** none (infra). Confirm `git status` does not list the AVI.
-- **Open:** Need private GitHub remote and first push.
-- **Next:** Overlay review for the lumen mask; other person clones and copies the AVI locally.
+- **Open:** GitHub CLI (`gh`) is not installed on this machine; local commit exists, remote not created.
+- **Next:** Install GitHub CLI, then `gh repo create iisc-rbc-tracking --private --source=. --remote=origin --push`. Overlay review for the lumen mask; other person clones and copies the AVI locally.
 
 
 

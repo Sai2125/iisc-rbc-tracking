@@ -1,26 +1,23 @@
 """
-STAGE 3 — Hybrid Kymograph DP + Confidence-Weighted RTS Kalman Smoother (Maximum Accuracy)
+STAGE 3 — Multi-Cell Successive Kymograph Peeling + RTS Kalman Smoother
 
-Architecture (Why this achieves sub-pixel accuracy from Bottom-Right Entrance to Top-Left Exit):
-1. Stage 3A — Strict Entrance/Exit Gating & Space-Time Kymograph DP:
-   - Builds the 2D Space-Time Kymograph K[t, x] strictly inside the peeled lumen mask.
-   - Detects exact passage windows [t_enter .. t_exit] where a real bright-core RBC
-     enters the Bottom-Right flare (x ~ 1277) and exits the Top-Left flare (x ~ 0).
-   - Zero boxes, zero lines, and zero HUD on empty frames before t_enter or after t_exit.
-   - Uses Dynamic Programming on K[t, x] to find the global coarse guide path x_dp(t).
+Fixes both:
+1. Back-to-Back / Simultaneous Cells in the Tube (e.g. Cell #2 at Frame 2335 and
+   Cell #3 right behind it at Frame 2402):
+   - Detects all distinct cell entrance peaks in the bottom-right flare separated by
+     >= 45 frames (even when an earlier cell is still inside the bore!).
+   - Solves each cell's monotonic right-to-left trajectory x(t) via Dynamic Programming
+     and immediately TERMINATES the track the instant the cell reaches the left exit
+     boundary (x <= 12 px), then PEELS (zeros out) that cell's ridge from the kymograph
+     so a trailing cell (Cell #3) tracks its own ridge cleanly without merging!
+   - Renders simultaneous bounding boxes + color-coded HUD cards when Cell #2 and
+     Cell #3 are inside the channel at the same time.
 
-2. Stage 3B — Confidence-Weighted 2D Sub-Pixel Centroid Extraction:
-   - Around x_dp(t), extracts the cell's exact 2D phase-contrast centroid (z_x, z_y),
-     bounding box (w, h), and signal-to-noise confidence score `conf_t`.
-   - In the wide flares (x > 1180 or x < 110), locks onto the bright cell core
-     (gray - bg > 0) so dark wall edges can never pull the box off-center.
-
-3. Stage 3C — OpenCV Kalman Filter + Rauch-Tung-Striebel (RTS) Forward-Backward Smoother:
-   - Runs a 4-state Kalman Filter [x, y, vx, vy] forward from t_enter to t_exit with
-     adaptive measurement noise R_t inversely proportional to `conf_t` (so if the cell
-     passes behind stuck wall dirt at x=435, R_t increases and Kalman glides smoothly).
-   - Runs a backward RTS smoothing pass from t_exit down to t_enter, eliminating 100%
-     of the phase lag when the cell accelerates into the narrow constriction bore!
+2. Clean Exit & Entrance Geometry (No End-of-Track Wiggle):
+   - Terminates each track immediately when the cell reaches x <= 12 px at the left
+     exit opening (never lingering on empty frames at x = 3..9 px).
+   - Smoothly tapers vertical position `cy` to the calibrated channel centerline so
+     there are zero vertical hooks or stair-step wiggles at entrance or exit.
 """
 import os
 import sys
@@ -29,6 +26,7 @@ import json
 import shutil
 import argparse
 from pathlib import Path
+from collections import defaultdict
 from numpy.lib.stride_tricks import sliding_window_view
 
 import cv2
@@ -91,11 +89,6 @@ def _medfilt1d(arr, k=15):
 
 
 def build_exact_lumen_geometry(bg):
-    """
-    Fit the channel centerline and trace the upper and lower glass walls across x = 0..W-1.
-    Peels inside the walls (especially in the flares where the upper wall at x=1248, y=360
-    has a static dirt speck) so wall artifacts are completely excluded.
-    """
     h, w = bg.shape[:2]
 
     xs_fit = np.arange(120, w - 120, dtype=np.float64)
@@ -142,27 +135,68 @@ def build_exact_lumen_geometry(bg):
 
 
 # ====================================================================
-# STAGE 3A: KYMOGRAPH DYNAMIC PROGRAMMING (COARSE GLOBAL PROPOSAL)
+# STAGE 3A: SUCCESSIVE KYMOGRAPH DP WITH IMMEDIATE EXIT CUTOFF
 # ====================================================================
 
-def solve_monotonic_kymograph_path(kymo_window, x_start_min=1225, x_end_max=20):
+def find_all_entrance_peaks(r_smooth, r_raw, r_thresh, min_distance=48):
     """
-    Find the globally optimal right-to-left ridge x_dp(t) on the T x W kymograph
-    connecting the bottom-right entrance [x_start_min..W-1] to the top-left exit [0..x_end_max].
+    Find every distinct cell entrance peak in the bottom-right flare, even when two
+    cells enter only ~55-75 frames apart (like Cell #2 at Frame 2374 and Cell #3 at Frame 2434).
     """
-    T, W = kymo_window.shape
-    if T < 2:
-        return [float(W - 1)] * T
+    T = len(r_smooth)
+    candidates = []
+    for t in range(2, T - 2):
+        if r_smooth[t] >= r_thresh and r_smooth[t] >= r_smooth[t - 1] and r_smooth[t] >= r_smooth[t + 1]:
+            candidates.append((float(r_smooth[t]), t))
 
-    k_smooth = cv2.GaussianBlur(kymo_window.astype(np.float32), (9, 3), 0)
+    # Greedy non-maximum suppression by peak height with min_distance=48 frames
+    candidates.sort(reverse=True)
+    selected_peaks = []
+    for val, t_pk in candidates:
+        if all(abs(t_pk - existing) >= min_distance for existing in selected_peaks):
+            selected_peaks.append(t_pk)
+    selected_peaks.sort()
 
-    dp = np.full((T, W), -1e12, dtype=np.float64)
-    back = np.zeros((T, W), dtype=np.int32)
+    # For each entrance peak, walk back at most 28 frames to find the exact entrance frame at x ~ 1272
+    entrances = []
+    for i, t_pk in enumerate(selected_peaks):
+        t_enter = t_pk
+        # Do not walk back into a previous cell's entrance
+        prev_limit = selected_peaks[i - 1] + 25 if i > 0 else 0
+        min_back = max(prev_limit, t_pk - 28)
+        while t_enter > min_back and r_raw[t_enter - 1] >= 0.45 * r_thresh:
+            t_enter -= 1
+        entrances.append((t_enter, t_pk))
 
+    return entrances
+
+
+def trace_single_cell_dp_ridge(kymo_full, t_enter, l_smooth, l_thresh, x_start_min=1230, x_exit_cutoff=14):
+    """
+    Given a cell's entrance frame `t_enter`, solve for its individual right-to-left
+    trajectory ridge across the kymograph and find its OWN exit frame `t_exit` (rather
+    than blindly taking argmax over a 460-frame window, which previously confused
+    Cell #2's exit with Cell #3's exit!).
+
+    Once solved, cuts off the trajectory immediately as soon as the cell reaches
+    `x <= x_exit_cutoff` (14 px) so the box never lingers or goes haywire at x = 3..9 px!
+    """
+    T_total, W = kymo_full.shape
+    max_duration = min(430, T_total - t_enter)
+    if max_duration < 160:
+        return None, None
+
+    k_win = kymo_full[t_enter: t_enter + max_duration]
+    k_smooth = cv2.GaussianBlur(k_win.astype(np.float32), (9, 3), 0)
+
+    dp = np.full((max_duration, W), -1e12, dtype=np.float64)
+    back = np.zeros((max_duration, W), dtype=np.int32)
+
+    # Start in the bottom-right entrance zone [x_start_min .. W-1]
     dp[0, x_start_min:] = k_smooth[0, x_start_min:] * 2.5
 
-    max_step = 26
-    for t in range(1, T):
+    max_step = 24
+    for t in range(1, max_duration):
         prev_row = dp[t - 1]
         best_val = np.full(W, -1e12, dtype=np.float64)
         best_prev = np.arange(W, dtype=np.int32)
@@ -173,8 +207,7 @@ def solve_monotonic_kymograph_path(kymo_window, x_start_min=1225, x_end_max=20):
             x_coords = np.arange(limit)
             in_bore = (x_coords >= 110) & (x_coords <= 1180)
             target_step = np.where(in_bore, 5.4, 1.35)
-            # Light smoothness regularizer so real kymograph contrast dominates
-            step_penalty = 0.18 * ((step - target_step) ** 2)
+            step_penalty = 0.22 * ((step - target_step) ** 2)
 
             score = cand_prev - step_penalty
             better = score > best_val[:limit]
@@ -184,13 +217,72 @@ def solve_monotonic_kymograph_path(kymo_window, x_start_min=1225, x_end_max=20):
         dp[t] = best_val + k_smooth[t]
         back[t] = best_prev
 
-    end_x = int(np.argmax(dp[T - 1, :x_end_max + 1]))
-    path_x = [0] * T
-    path_x[T - 1] = end_x
-    for t in range(T - 1, 0, -1):
+    # Find the earliest valid exit time `t_rel` in [180 .. max_duration-1] where the DP path
+    # reaches the left exit zone [0 .. 22] with strong average per-frame score and a local left-flare exit signal
+    best_t_rel = None
+    best_exit_score = -1e12
+
+    for t_rel in range(185, max_duration):
+        f_global = t_enter + t_rel
+        # Normalize path score by length so earlier (true) exits aren't beaten by lingering at x=0
+        avg_dp_score = float(dp[t_rel, :22].max()) / float(t_rel)
+        left_bonus = 0.6 * float(l_smooth[f_global])
+        total_score = avg_dp_score + left_bonus
+        if l_smooth[f_global] >= 0.65 * l_thresh and total_score > best_exit_score:
+            best_exit_score = total_score
+            best_t_rel = t_rel
+            # Once we pass a clear local peak in l_smooth that starts dropping, stop so we don't jump to the NEXT cell's exit!
+            if t_rel > 220 and l_smooth[f_global] < 0.75 * l_smooth[max(t_enter + 185, f_global - 12): f_global + 1].max():
+                break
+
+    if best_t_rel is None:
+        # Fallback to best normalized score in [200 .. max_duration-1]
+        scores = [float(dp[tr, :22].max()) / float(tr) for tr in range(200, max_duration)]
+        if not scores:
+            return None, None
+        best_t_rel = 200 + int(np.argmax(scores))
+
+    # Backtrack from best_t_rel
+    T_len = best_t_rel + 1
+    end_x = int(np.argmax(dp[best_t_rel, :22]))
+    path_x = [0] * T_len
+    path_x[T_len - 1] = end_x
+    for t in range(T_len - 1, 0, -1):
         path_x[t - 1] = int(back[t, path_x[t]])
 
-    return [float(x) for x in path_x]
+    # Trim any leading stationary frames where the DP waited at x > 1250 for a later cell
+    start_trim = 0
+    while start_trim + 10 < T_len and (path_x[start_trim] - path_x[start_trim + 8]) < 3:
+        start_trim += 1
+
+    # Trim any trailing frames once the cell has reached x <= x_exit_cutoff (14 px)
+    # so the ending NEVER goes haywire at x = 3..9 px after the cell exits!
+    end_trim = T_len - 1
+    for idx in range(start_trim, T_len):
+        if path_x[idx] <= x_exit_cutoff:
+            end_trim = idx
+            break
+
+    if end_trim - start_trim < 120:
+        return None, None
+
+    trimmed_x = [float(x) for x in path_x[start_trim: end_trim + 1]]
+    actual_t_enter = t_enter + start_trim
+    return actual_t_enter, trimmed_x
+
+
+def peel_ridge_from_kymograph(kymograph, t_enter, path_x, half_width_x=38):
+    """
+    Erase (zero out) a tracked cell's space-time ridge from the kymograph so a second
+    cell right behind it (like Cell #3 behind Cell #2) is tracked cleanly without interference.
+    """
+    T_total, W = kymograph.shape
+    for idx, x_val in enumerate(path_x):
+        t = t_enter + idx
+        if 0 <= t < T_total:
+            x0 = max(0, int(round(x_val)) - half_width_x)
+            x1 = min(W, int(round(x_val)) + half_width_x + 1)
+            kymograph[t, x0:x1] = 0.0
 
 
 # ====================================================================
@@ -207,21 +299,11 @@ def extract_subpixel_observation(
     top_wall,
     bot_wall
 ):
-    """
-    Around the DP guide coordinate `guide_x`, locate the true 2D sub-pixel centroid
-    (z_x, z_y), bounding box (bw, bh), and observation confidence `conf` in [0.05, 1.0].
-    - In the wide flares (x < 110 or x > 1180), cells have a bright phase-contrast center
-      (gray - bg > 0), so we weight positive brightness + motion to lock dead-center onto
-      the round cell body without ever snapping to the dark flare walls!
-    - In the narrow constriction bore (110 <= x <= 1180), cells are squeezed between the
-      walls and create a strong inter-frame motion + background dipole.
-    """
     h_roi, w_img = gray_roi.shape
     x_c = int(np.clip(round(guide_x), 0, w_img - 1))
 
-    # Search radius around guide_x: +-24 px
-    x0 = max(0, x_c - 24)
-    x1 = min(w_img, x_c + 25)
+    x0 = max(0, x_c - 20)
+    x1 = min(w_img, x_c + 21)
 
     patch_gray = gray_roi[:, x0:x1]
     patch_bg = bg_roi[:, x0:x1]
@@ -233,11 +315,9 @@ def extract_subpixel_observation(
         patch_mot = np.abs(patch_gray - patch_bg)
 
     if x_c > 1180 or x_c < 110:
-        # In entrance/exit flares: lock onto the bright round cell center (gray > bg)
         pos_diff = np.maximum(0.0, patch_gray - patch_bg)
         energy = pos_diff * np.sqrt(np.maximum(1.0, patch_mot))
     else:
-        # In narrow bore: use full contrast * motion, downweighting known static dirt at x=430..450
         abs_diff = np.abs(patch_gray - patch_bg)
         energy = abs_diff * np.sqrt(np.maximum(1.0, patch_mot))
 
@@ -246,23 +326,26 @@ def extract_subpixel_observation(
 
     peak_e = float(energy.max())
     if peak_e >= 12.0:
-        thresh = 0.45 * peak_e
+        thresh = 0.48 * peak_e
         ys, xs = np.where(energy >= thresh)
     else:
         ys, xs = np.array([]), np.array([])
+
+    center_y_wall = float(0.5 * (top_wall[x_c] + bot_wall[x_c]))
 
     if xs.size >= 3:
         weights = energy[ys, xs] ** 1.5
         w_sum = float(weights.sum())
         zx = float(x0 + np.sum(xs * weights) / w_sum)
-        zy = float(y_min_roi + np.sum(ys * weights) / w_sum)
+        raw_zy = float(y_min_roi + np.sum(ys * weights) / w_sum)
+        # Regularize vertical coordinate gently toward channel centerline so flare entrance/exit never hooks vertically
+        zy = 0.45 * raw_zy + 0.55 * center_y_wall
         bw_raw = int(xs.max() - xs.min() + 1)
         bh_raw = int(ys.max() - ys.min() + 1)
         conf = float(np.clip(peak_e / 80.0, 0.15, 1.0))
     else:
-        # Low-SNR frame mid-bore: fall back to guide_x with low confidence so Kalman Smoother dominates
         zx = float(guide_x)
-        zy = float(0.5 * (top_wall[x_c] + bot_wall[x_c]))
+        zy = center_y_wall
         bw_raw, bh_raw = (14, 13) if (x_c > 1180 or x_c < 110) else (18, 6)
         conf = 0.05
 
@@ -280,24 +363,12 @@ def extract_subpixel_observation(
 # ====================================================================
 
 def kalman_rts_smooth_passage(observations, top_wall, bot_wall):
-    """
-    Runs a 4-state Constant-Velocity OpenCV Kalman Filter [x, y, vx, vy] forward across
-    the passage observations, followed by a Rauch-Tung-Striebel (RTS) backward smoother.
-
-    Why this is superior to both raw DP and forward-only Kalman:
-    - Forward pass uses cv2.KalmanFilter with adaptive measurement noise R_t scaled by
-      1 / conf_t^2 (high confidence on clear cell frames -> tight lock; low confidence
-      behind wall dirt -> trusts velocity momentum).
-    - Backward RTS pass eliminates 100% of the phase lag when the cell accelerates into
-      the constriction bore at x=1185 and decelerates into the left flare at x=110.
-    """
     N = len(observations)
     if N == 0:
         return []
 
     w_max = len(top_wall) - 1
 
-    # State transition matrix F (4x4) and Measurement matrix H (2x4)
     F = np.array(
         [[1, 0, 1, 0],
          [0, 1, 0, 1],
@@ -310,9 +381,8 @@ def kalman_rts_smooth_passage(observations, top_wall, bot_wall):
          [0, 1, 0, 0]],
         dtype=np.float64
     )
-    Q = np.diag([0.4, 0.15, 0.35, 0.05]).astype(np.float64)
+    Q = np.diag([0.35, 0.08, 0.30, 0.02]).astype(np.float64)
 
-    # Also instantiate cv2.KalmanFilter(4, 2) for OpenCV state tracking
     kf = cv2.KalmanFilter(4, 2)
     kf.transitionMatrix = F.astype(np.float32)
     kf.measurementMatrix = H.astype(np.float32)
@@ -323,17 +393,15 @@ def kalman_rts_smooth_passage(observations, top_wall, bot_wall):
     x_filt_list = np.zeros((N, 4), dtype=np.float64)
     P_filt_list = np.zeros((N, 4, 4), dtype=np.float64)
 
-    # Initialize at t = 0
     z0 = observations[0]
     vx0 = (observations[min(N - 1, 5)]["zx"] - z0["zx"]) / float(max(1, min(N - 1, 5)))
     vy0 = (observations[min(N - 1, 5)]["zy"] - z0["zy"]) / float(max(1, min(N - 1, 5)))
     x_curr = np.array([z0["zx"], z0["zy"], vx0, vy0], dtype=np.float64)
-    P_curr = np.diag([4.0, 2.0, 4.0, 1.0]).astype(np.float64)
+    P_curr = np.diag([4.0, 1.5, 4.0, 0.5]).astype(np.float64)
 
     kf.statePost = x_curr.reshape(4, 1).astype(np.float32)
     kf.errorCovPost = P_curr.astype(np.float32)
 
-    # 1. Forward Kalman Filter Pass
     for t in range(N):
         obs = observations[t]
         if t == 0:
@@ -347,10 +415,9 @@ def kalman_rts_smooth_passage(observations, top_wall, bot_wall):
         x_pred_list[t] = x_pred
         P_pred_list[t] = P_pred
 
-        # Adaptive measurement noise covariance R_t based on detection confidence
         conf = max(0.05, obs["conf"])
         sigma_z = 2.2 / conf
-        R_t = np.diag([sigma_z ** 2, (sigma_z * 0.7) ** 2])
+        R_t = np.diag([sigma_z ** 2, (sigma_z * 0.5) ** 2])
 
         z_t = np.array([obs["zx"], obs["zy"]], dtype=np.float64)
         y_innov = z_t - (H @ x_pred)
@@ -366,7 +433,7 @@ def kalman_rts_smooth_passage(observations, top_wall, bot_wall):
         x_filt_list[t] = x_curr
         P_filt_list[t] = P_curr
 
-    # 2. Backward Rauch-Tung-Striebel (RTS) Smoother Pass (Zero Phase Lag!)
+    # Backward RTS Smoother Pass
     x_smooth = np.zeros((N, 4), dtype=np.float64)
     P_smooth = np.zeros((N, 4, 4), dtype=np.float64)
     x_smooth[-1] = x_filt_list[-1]
@@ -378,7 +445,7 @@ def kalman_rts_smooth_passage(observations, top_wall, bot_wall):
         x_smooth[t] = x_filt_list[t] + C_t @ (x_smooth[t + 1] - x_pred_list[t + 1])
         P_smooth[t] = P_filt_list[t] + C_t @ (P_smooth[t + 1] - P_pred_next) @ C_t.T
 
-    # Enforce monotonic right-to-left X progression and build final trajectory dicts
+    # Build smooth, monotonically decreasing right-to-left trajectory with zero end-wiggle
     smoothed_track = []
     areas_so_far = []
 
@@ -391,14 +458,17 @@ def kalman_rts_smooth_passage(observations, top_wall, bot_wall):
         x_idx = int(np.clip(round(cx), 0, w_max))
         wt = float(top_wall[x_idx])
         wb = float(bot_wall[x_idx])
+        yc_wall = 0.5 * (wt + wb)
         lumen_h = max(4.0, wb - wt)
 
-        # In the narrow bore (110 <= x <= 1180), lock cy to the lumen centerline;
-        # in the wide flares, allow smooth vertical positioning inside the flare walls
+        # Smoothly blend cy with channel centerline so there is zero vertical hook at x=1180 or x=110
         if 110 <= x_idx <= 1180:
-            cy = 0.5 * (wt + wb)
+            cy = yc_wall
         else:
-            cy = float(np.clip(x_smooth[t, 1], wt + 3.0, wb - 3.0))
+            dev = np.clip(x_smooth[t, 1] - yc_wall, -3.5, 3.5)
+            # Taper vertical deviation to 0 near the extreme entrance/exit edges
+            edge_taper = min(1.0, min(x_idx / 40.0, (w_max - x_idx) / 40.0))
+            cy = float(yc_wall + edge_taper * dev)
 
         bw_raw, bh_raw = obs["bw_raw"], obs["bh_raw"]
         if x_idx > 1180 or x_idx < 110:
@@ -444,7 +514,7 @@ def kalman_rts_smooth_passage(observations, top_wall, bot_wall):
 
 
 # ====================================================================
-# FULL HYBRID PIPELINE (Kymograph DP + 2D Matched Obs + RTS Kalman)
+# FULL HYBRID PIPELINE (Multi-Cell Kymograph Peeling + RTS Kalman)
 # ====================================================================
 
 def detect_and_track_passages(
@@ -467,9 +537,7 @@ def detect_and_track_passages(
         cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 
     kymograph = np.zeros((frames_to_run, w_img), dtype=np.float32)
-    right_entrance_signal = np.zeros(frames_to_run, dtype=np.float32)
-    left_exit_signal = np.zeros(frames_to_run, dtype=np.float32)
-    roi_cache = []  # Cache cropped uint8 ROI strips in RAM so Stage 3B needs 0 disk seeks!
+    roi_cache = []
 
     prev_gray_roi = None
     lag3_buffer = []
@@ -478,8 +546,6 @@ def detect_and_track_passages(
         ok, frame = cap.read()
         if not ok:
             kymograph = kymograph[:offset]
-            right_entrance_signal = right_entrance_signal[:offset]
-            left_exit_signal = left_exit_signal[:offset]
             break
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
@@ -516,11 +582,9 @@ def detect_and_track_passages(
         col_score[1180:] = np.sqrt(col_pos[1180:] * np.maximum(0.0, col_mot[1180:] - 4.0)) * 1.4
 
         kymograph[offset] = col_score
-        right_entrance_signal[offset] = float(col_score[1215:1278].max())
-        left_exit_signal[offset] = float(col_score[5:105].max())
 
         if (offset + 1) % 500 == 0:
-            print(f"      [Stage 3A] Kymograph built for {offset + 1}/{frames_to_run} frames...")
+            print(f"      [Stage 3A] Kymograph built for {offset + 1}/{frames_to_run} frames...", flush=True)
 
     cap.release()
 
@@ -528,8 +592,7 @@ def detect_and_track_passages(
     if actual_frames < 20:
         return {}
 
-    # Subtract temporal median baseline from each column of the kymograph so any persistent
-    # static wall residual is 0.0 and only true transient cell passages stand out!
+    # Subtract temporal median baseline per column
     col_baseline = np.median(kymograph, axis=0, keepdims=True)
     kymograph = np.maximum(0.0, kymograph - col_baseline)
 
@@ -539,72 +602,44 @@ def detect_and_track_passages(
     r_smooth = np.convolve(right_entrance_signal, np.ones(7) / 7.0, mode="same")
     l_smooth = np.convolve(left_exit_signal, np.ones(7) / 7.0, mode="same")
 
-    # Robust threshold: median + 3.5 * MAD (or minimum floor 8.0)
     r_med = float(np.median(r_smooth))
     r_mad = float(np.median(np.abs(r_smooth - r_med))) + 1e-3
-    r_thresh = max(8.0, r_med + 3.5 * r_mad)
+    r_thresh = max(8.0, r_med + 3.2 * r_mad)
 
     l_med = float(np.median(l_smooth))
     l_mad = float(np.median(np.abs(l_smooth - l_med))) + 1e-3
-    l_thresh = max(8.0, l_med + 3.5 * l_mad)
+    l_thresh = max(8.0, l_med + 3.0 * l_mad)
 
-    passages = []
-    t = 0
-    while t < actual_frames - 150:
-        if r_smooth[t] >= r_thresh:
-            # Find local peak of right-flare entrance within [t .. t + 60]
-            r_win = r_smooth[t: min(actual_frames, t + 60)]
-            t_peak_r = t + int(np.argmax(r_win))
-            # Walk back at most 25 frames to capture the very first frame the cell enters at x=1277
-            t_enter = t_peak_r
-            min_back = max(0, t_peak_r - 25)
-            while t_enter > min_back and right_entrance_signal[t_enter - 1] >= 0.4 * r_thresh:
-                t_enter -= 1
+    # Detect ALL distinct entrance peaks (including back-to-back cells ~55 frames apart!)
+    entrances = find_all_entrance_peaks(r_smooth, right_entrance_signal, r_thresh, min_distance=48)
 
-            # Look for corresponding left-flare exit between t_peak_r + 140 and t_peak_r + 460
-            w_start = min(actual_frames - 1, t_peak_r + 140)
-            w_end = min(actual_frames, t_peak_r + 460)
-            exit_window = l_smooth[w_start:w_end]
-            if exit_window.size > 0 and float(exit_window.max()) >= l_thresh:
-                rel_peak = int(np.argmax(exit_window))
-                t_exit_peak = w_start + rel_peak
-                # Walk forward at most 65 frames while cell finishes exiting x -> 0
-                t_exit = t_exit_peak
-                max_fwd = min(actual_frames - 1, t_exit_peak + 65)
-                while t_exit < max_fwd and left_exit_signal[t_exit + 1] >= 0.35 * l_thresh:
-                    t_exit += 1
-
-                passages.append((t_enter, t_exit))
-                t = max(t + 1, t_exit + 30)
-                continue
-        t += 1
-
-    if not passages:
-        # Fallback if threshold was slightly high on this window: pick strongest right->left pair
-        r_peak = int(np.argmax(r_smooth[:actual_frames - 180]))
-        if r_smooth[r_peak] >= 6.0:
-            t_enter = max(0, r_peak - 15)
-            l_win = l_smooth[min(actual_frames - 1, t_enter + 160): min(actual_frames, t_enter + 480)]
-            if l_win.size > 0:
-                t_exit = min(actual_frames - 1, t_enter + 160 + int(np.argmax(l_win)) + 35)
-                passages.append((t_enter, t_exit))
-
-    if not passages:
-        return {}
-
-    # Stage 3B & 3C: Uses cached ROI strips in RAM (zero disk seeks!)
+    work_kymo = kymograph.copy()
     final_tracks = {}
+    tid = 1
 
-    for tid, (t0, t1) in enumerate(passages, start=1):
-        print(f"      [Stage 3B/3C] Refining Passage #{tid} (Frames {start_frame + t0} -> {start_frame + t1}) with Kymograph DP + RTS Kalman Smoother...", flush=True)
-        kymo_win = kymograph[t0:t1 + 1]
-        dp_xs = solve_monotonic_kymograph_path(kymo_win, x_start_min=1225, x_end_max=20)
+    for t_enter_cand, _ in entrances:
+        actual_t_enter, dp_xs = trace_single_cell_dp_ridge(
+            work_kymo, t_enter_cand, l_smooth, l_thresh, x_start_min=1225, x_exit_cutoff=14
+        )
+        if actual_t_enter is None or not dp_xs:
+            continue
+
+        # Peel this cell's ridge out of work_kymo so a trailing cell right behind it (Cell #3)
+        # tracks its own ridge cleanly!
+        peel_ridge_from_kymograph(work_kymo, actual_t_enter, dp_xs, half_width_x=38)
+
+        t_end = actual_t_enter + len(dp_xs) - 1
+        print(
+            f"      [Stage 3B/3C] Refining CELL #{tid} (Frames {start_frame + actual_t_enter} -> {start_frame + t_end}) "
+            f"via Kymograph Peeling + RTS Kalman Smoother...",
+            flush=True
+        )
 
         observations = []
         prev_g_roi = None
 
         for step_idx, gx in enumerate(dp_xs):
-            cache_idx = t0 + step_idx
+            cache_idx = actual_t_enter + step_idx
             if cache_idx >= len(roi_cache):
                 break
             f_idx = start_frame + cache_idx
@@ -618,7 +653,10 @@ def detect_and_track_passages(
             observations.append(obs)
             prev_g_roi = gray_roi
 
-        final_tracks[tid] = kalman_rts_smooth_passage(observations, top_wall, bot_wall)
+        smoothed = kalman_rts_smooth_passage(observations, top_wall, bot_wall)
+        if smoothed:
+            final_tracks[tid] = smoothed
+            tid += 1
 
     return final_tracks
 
@@ -670,8 +708,18 @@ def compute_biomarker(track_id, path):
 
 
 # ====================================================================
-# RENDER ANNOTATED VIDEO (No Box When No Cell, Exact Box During Passage)
+# RENDER ANNOTATED VIDEO (Supports Back-to-Back Simultaneous Cells!)
 # ====================================================================
+
+def _cell_color_bgr(track_id):
+    palette = [
+        (50, 255, 100),   # Cell #1: Neon Green
+        (0, 215, 255),    # Cell #2: Gold / Amber
+        (255, 200, 50),   # Cell #3: Cyan-Blue
+        (200, 110, 255),  # Cell #4: Magenta
+    ]
+    return palette[(track_id - 1) % len(palette)]
+
 
 def render_tracked_video(
     video_path,
@@ -680,16 +728,17 @@ def render_tracked_video(
     valid_tracks,
     biomarkers_by_id,
     out_dir,
-    pad_frames=25,
+    pad_frames=20,
     playback_fps=20.0
 ):
     out_mp4 = os.path.join(out_dir, "tracked_cell.mp4")
     legacy_mp4 = os.path.join(out_dir, "active_passages_only.mp4")
 
-    by_frame = {}
+    # Map frame_idx -> LIST of active cell points (so back-to-back cells #2 and #3 both render!)
+    by_frame = defaultdict(list)
     for tid, path in valid_tracks.items():
         for pt in path:
-            by_frame[pt["frame"]] = pt
+            by_frame[pt["frame"]].append(pt)
 
     cap = cv2.VideoCapture(video_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -699,22 +748,19 @@ def render_tracked_video(
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(out_mp4, fourcc, playback_fps, (w, h))
 
-    frames_to_render = []
+    frames_set = set()
     if valid_tracks:
         for tid in sorted(valid_tracks.keys()):
             path = valid_tracks[tid]
             f0 = max(0, path[0]["frame"] - pad_frames)
             f1 = min(total_frames - 1, path[-1]["frame"] + pad_frames)
             for f in range(f0, f1 + 1):
-                if not frames_to_render or f > frames_to_render[-1]:
-                    frames_to_render.append(f)
+                frames_set.add(f)
+        frames_to_render = sorted(frames_set)
     else:
         frames_to_render = list(range(1500, min(1950, total_frames)))
 
     trail_by_id = {tid: [] for tid in valid_tracks}
-    color = (50, 255, 100)
-
-    # Seek ONLY when jumping to a non-consecutive frame (never call cap.set on consecutive frames!)
     current_pos = -999
 
     for f_idx in frames_to_render:
@@ -727,9 +773,10 @@ def render_tracked_video(
 
         vis = frame.copy() if frame.ndim == 3 else cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
 
-        d = by_frame.get(f_idx)
-        if d is not None:
+        active_cells = by_frame.get(f_idx, [])
+        for idx_in_frame, d in enumerate(active_cells):
             tid = d["track_id"]
+            color = _cell_color_bgr(tid)
             bx, by, bw, bh = d["bbox"]
             cx_i, cy_i = int(round(d["cx"])), int(round(d["cy"]))
             trail_by_id[tid].append((cx_i, cy_i))
@@ -754,7 +801,9 @@ def render_tracked_video(
 
             card_w, card_h = 295, 60
             card_x = int(np.clip(cx_i - card_w // 2, 10, w - card_w - 10))
-            card_y = y0 - card_h - 14 if y0 > card_h + 38 else y1 + 14
+            # Alternate HUD placement above/below if two cells are close horizontally
+            place_above = (idx_in_frame % 2 == 0) and (y0 > card_h + 38)
+            card_y = y0 - card_h - 14 if place_above else min(h - card_h - 6, y1 + 14)
 
             roi_hud = vis[card_y:card_y + card_h, card_x:card_x + card_w]
             if roi_hud.shape[0] == card_h and roi_hud.shape[1] == card_w:
@@ -771,11 +820,12 @@ def render_tracked_video(
             cv2.putText(vis, line3, (card_x + 8, card_y + 53), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (180, 225, 255), 1, cv2.LINE_AA)
 
         cv2.rectangle(vis, (0, 0), (w, 28), (14, 17, 22), -1)
-        if d is not None:
-            status_txt = f"IISc RBC Passage Tracker (Kymograph + RTS Kalman) | Frame {f_idx} ({f_idx / 10.0:.1f} ms) | Tracking CELL #{d['track_id']}"
+        if active_cells:
+            ids_str = ", ".join(f"CELL #{c['track_id']}" for c in active_cells)
+            status_txt = f"IISc RBC Passage Tracker | Frame {f_idx} ({f_idx / 10.0:.1f} ms) | Tracking {ids_str}"
             txt_col = (120, 255, 150)
         else:
-            status_txt = f"IISc RBC Passage Tracker (Kymograph + RTS Kalman) | Frame {f_idx} ({f_idx / 10.0:.1f} ms) | No cell in passage"
+            status_txt = f"IISc RBC Passage Tracker | Frame {f_idx} ({f_idx / 10.0:.1f} ms) | No cell in passage"
             txt_col = (170, 175, 185)
         cv2.putText(vis, status_txt, (14, 19), cv2.FONT_HERSHEY_SIMPLEX, 0.48, txt_col, 1, cv2.LINE_AA)
 
@@ -797,9 +847,9 @@ def render_tracked_video(
 # ====================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Stage 3: Hybrid Kymograph DP + RTS Kalman Smoother RBC Tracker")
+    parser = argparse.ArgumentParser(description="Stage 3: Multi-Cell Kymograph Peeling + RTS Kalman Smoother")
     parser.add_argument("--max-frames", type=int, default=1500, help="Frames to scan (default: 1500; pass 0 for all 37,274)")
-    parser.add_argument("--start-frame", type=int, default=1450, help="Frame index to start from (default: 1450, covering the true cell passage at frames 1538..1898; pass 0 to scan from frame 0)")
+    parser.add_argument("--start-frame", type=int, default=1450, help="Frame index to start from (default: 1450)")
     parser.add_argument("--video", type=str, default=None, help="Optional override path to .avi file")
     args = parser.parse_args()
 
@@ -815,7 +865,7 @@ def main():
     fps = calib.get("fps", 10000)
 
     print("=" * 68)
-    print("STAGE 3: HYBRID KYMOGRAPH DP + RTS KALMAN SMOOTHER")
+    print("STAGE 3: MULTI-CELL KYMOGRAPH PEELING + RTS KALMAN SMOOTHER")
     print("=" * 68)
     print(f"Video path : {video_path}")
     print(f"Output dir : {OUT}")
@@ -835,7 +885,7 @@ def main():
     if args.max_frames and args.max_frames > 0:
         frames_to_run = min(frames_to_run, args.max_frames)
 
-    print(f"\n[1/2] Running Hybrid Kymograph DP + RTS Kalman Smoother on {frames_to_run} frames (start={args.start_frame})...")
+    print(f"\n[1/2] Running Multi-Cell Kymograph Peeling + RTS Kalman Smoother on {frames_to_run} frames (start={args.start_frame})...")
 
     valid_tracks = detect_and_track_passages(
         video_path=video_path,
@@ -913,7 +963,7 @@ def main():
         valid_tracks=valid_tracks,
         biomarkers_by_id=biomarkers_by_id,
         out_dir=out_dir,
-        pad_frames=25,
+        pad_frames=20,
         playback_fps=20.0,
     )
 

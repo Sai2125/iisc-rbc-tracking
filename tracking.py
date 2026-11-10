@@ -293,26 +293,62 @@ def trace_single_cell_dp_ridge(kymo_full, t_enter, l_smooth, l_thresh, x_start_m
     return actual_t_enter, trimmed_x
 
 
-def peel_ridge_from_kymograph(kymograph, t_enter, path_x, half_width_x=16):
+def peel_ridge_from_kymograph(kymograph, t_enter, path_x, half_width_x=34, half_time_t=10):
     """
-    Erase (zero out) ONLY a tight ±16 px spatial band around a tracked cell's 2D
-    space-time ridge `(t, path_x[t])` from the kymograph!
-    Why ±16 px?
-      - A single RBC is ~14-18 px long.
-      - If a second cell enters only 8-15 frames (~20-35 px) behind the first cell,
-        at frame `t` the first cell is at `x_1(t)` while the second cell is at
-        `x_2(t) = x_1(t) + 28 px`!
-      - Peeling ±16 px removes Cell #1 completely while leaving Cell #2's ridge untouched!
+    Erase (zero out) a tracked cell's full 2D space-time footprint (±34 px by ±10 frames)
+    from `kymograph` so the leading/trailing motion lobes of the SAME cell can never be
+    re-extracted as a duplicate track!
     """
     T_total, W = kymograph.shape
     for idx, x_val in enumerate(path_x):
-        t = t_enter + idx
-        if 0 <= t < T_total:
-            x0 = max(0, int(round(x_val)) - half_width_x)
-            x1 = min(W, int(round(x_val)) + half_width_x + 1)
-            kymograph[t, x0:x1] = 0.0
-    # Also clear a tiny 6-frame window at the entrance edge around t_enter so the exact same cell doesn't re-trigger
-    kymograph[max(0, t_enter - 3): min(T_total, t_enter + 5), max(1215, int(round(path_x[0])) - 18):] = 0.0
+        t_c = t_enter + idx
+        t0 = max(0, t_c - half_time_t)
+        t1 = min(T_total, t_c + half_time_t + 1)
+        x0 = max(0, int(round(x_val)) - half_width_x)
+        x1 = min(W, int(round(x_val)) + half_width_x + 1)
+        kymograph[t0:t1, x0:x1] = 0.0
+    # Also clear the right-flare entrance window for ±18 frames around t_enter
+    kymograph[max(0, t_enter - 18): min(T_total, t_enter + 22), 1185:] = 0.0
+
+
+def is_duplicate_trajectory(cand_t0, cand_xs, accepted_list, min_spatial_sep_px=45.0, min_time_sep_frames=22):
+    """
+    Physical Single-File Capillary Exclusion Rule:
+    Two distinct RBCs in a 4-px wide microchannel CANNOT sit on top of each other!
+    Rejects `cand_xs` if:
+      1. Its entrance or exit frame is within `min_time_sep_frames` (22 frames) of an existing track, OR
+      2. On overlapping frames, the two trajectories come closer than `min_spatial_sep_px` (45 px)
+         or cross each other!
+    """
+    cand_t1 = cand_t0 + len(cand_xs) - 1
+    cand_map = {cand_t0 + i: x for i, x in enumerate(cand_xs)}
+
+    for acc_t0, acc_xs in accepted_list:
+        acc_t1 = acc_t0 + len(acc_xs) - 1
+        if abs(cand_t0 - acc_t0) < min_time_sep_frames or abs(cand_t1 - acc_t1) < min_time_sep_frames:
+            return True
+
+        # Check overlapping frames in the bore (x in 110 .. 1180)
+        overlap_dists = []
+        signs = []
+        for i, ax in enumerate(acc_xs):
+            f = acc_t0 + i
+            if f in cand_map:
+                cx = cand_map[f]
+                if 110 <= ax <= 1180 or 110 <= cx <= 1180:
+                    overlap_dists.append(abs(cx - ax))
+                    if abs(cx - ax) > 5.0:
+                        signs.append(1 if cx > ax else -1)
+
+        if overlap_dists:
+            # If median or 25th-percentile separation is < 45 px, they are tracking the SAME cell!
+            if float(np.percentile(overlap_dists, 25)) < min_spatial_sep_px:
+                return True
+            # Single-file cells cannot overtake/cross each other inside a 4px capillary
+            if signs and len(set(signs)) > 1:
+                return True
+
+    return False
 
 
 # ====================================================================
@@ -645,7 +681,7 @@ def detect_and_track_passages(
     # along the first cell's 2D (t, x) diagonal, leaving the trailing cell's parallel ridge intact!)
     work_kymo = kymograph.copy()
     raw_extracted = []
-    max_cells = 80
+    max_cells = 40
 
     for _ in range(max_cells):
         actual_t_enter, dp_xs = extract_next_passage_from_kymograph(
@@ -656,11 +692,20 @@ def detect_and_track_passages(
         if actual_t_enter == "retry":
             continue
 
-        peel_ridge_from_kymograph(work_kymo, actual_t_enter, dp_xs, half_width_x=16)
+        # Always peel this ridge from work_kymo so the loop advances
+        peel_ridge_from_kymograph(work_kymo, actual_t_enter, dp_xs, half_width_x=34, half_time_t=10)
 
-        # Verify that this ridge has genuine independent signal energy (not a faint ghost echo of an already-peeled cell)
-        raw_Check = [kymograph[actual_t_enter + idx, int(round(x))] for idx, x in enumerate(dp_xs) if 0 <= actual_t_enter + idx < actual_frames]
-        if float(np.percentile(raw_Check, 75)) < 0.55 * r_thresh:
+        # Verify genuine independent signal energy in the original unpeeled kymograph
+        raw_check = [
+            kymograph[actual_t_enter + idx, max(0, int(round(x)) - 4): min(w_img, int(round(x)) + 5)].max()
+            for idx, x in enumerate(dp_xs)
+            if 0 <= actual_t_enter + idx < actual_frames
+        ]
+        if not raw_check or float(np.median(raw_check)) < 0.55 * r_thresh:
+            continue
+
+        # Enforce Physical Single-File Exclusion: reject if this trajectory overlaps an already-tracked cell!
+        if is_duplicate_trajectory(actual_t_enter, dp_xs, raw_extracted, min_spatial_sep_px=45.0, min_time_sep_frames=22):
             continue
 
         raw_extracted.append((actual_t_enter, dp_xs))

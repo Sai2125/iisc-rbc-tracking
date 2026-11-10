@@ -1,25 +1,37 @@
 """
-STAGE 3 — Detection + Tracking for deterministic RBC tracking
+STAGE 3 — End-to-End Passage RBC Detection, Tracking & Annotated Video Generator
 
-Uses Stage 1 calibration to:
-1. Detect cells per frame (background subtraction + Otsu + watershed)
-2. Track trajectories (Kalman filter + Hungarian assignment)
-3. Compute biomechanics (velocity, ADI, circularity, elongation)
+Tracks Red Blood Cells from the start of the microfluidic passage (Entrance Flare)
+through the narrow constriction bore to the end of the passage (Exit Flare).
 
-Output files:
-- output/stage3/trajectories.csv (per-frame cell positions)
-- output/stage3/biomechanics.csv (per-cell metrics)
-- output/stage3/track_summary.json (per-track statistics)
+Fixes over the original draft:
+1. Full-width exact interior lumen mask (x = 0..1279) including both entrance & exit flares,
+   peeled inside the dark glass walls and median-smoothed so glass wall shimmer & stuck dirt
+   (e.g. at x=435) are excluded.
+2. Bounding-box + contour extraction (`bbox_x, bbox_y, bbox_w, bbox_h, area, circularity, elongation`)
+   without full-frame Otsu hallucinations on empty frames.
+3. Channel-axis Kalman + Hungarian tracker with longitudinal velocity continuity so a fast cell
+   squeezing through the narrow bore keeps a single continuous Cell ID from entrance to exit.
+4. Stationary-speck rejection: filters out wall-vibration false positives that do not travel
+   along the channel passage.
+5. Direct annotated video output (`output/stage3/tracked_cells_video.mp4` and
+   `output/stage3/active_passages_only.mp4`) drawing the bounding box, trajectory trail,
+   Cell ID, and live biomechanics (Velocity, Area, Circularity, ADI) directly on the video.
 """
+import os
+import sys
+import csv
+import json
+import argparse
+from pathlib import Path
+from collections import defaultdict
+from numpy.lib.stride_tricks import sliding_window_view
+
 import cv2
 import numpy as np
-import json, os, csv, argparse, multiprocessing
-from pathlib import Path
-from multiprocessing import Pool
-from collections import defaultdict
 
 # ====================================================================
-# PATHS (Auto-detected relative to repo root, with fallback)
+# PATH RESOLUTION
 # ====================================================================
 ROOT_DIR = Path(__file__).resolve().parent
 VIDEO_FILENAME = "2A002 2_C001H001S0001-001.avi"
@@ -53,498 +65,578 @@ def _resolve_video_path(calib_video_path):
 OUT = _resolve_out_dir()
 CALIB_FILE = os.path.join(OUT, "calibration.json")
 BG_FILE = os.path.join(OUT, "median_bg.npy")
-VIDEO = None  # Will be read from calibration.json
 
-# ====================================================================
-# LOAD CALIBRATION
-# ====================================================================
 
 def load_calibration():
-    with open(CALIB_FILE, "r") as f:
+    with open(CALIB_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
+
 
 def load_background():
     return np.load(BG_FILE)
 
+
 # ====================================================================
-# DETECTION: Background Subtraction + Otsu + Watershed
+# EXACT FULL-WIDTH INTERIOR LUMEN MASK (x = 0 .. W-1)
 # ====================================================================
 
-def detect_cells(frame, background, width_profile_dict, y_margin=12.0, corridor_mask=None, verbose=False):
+def _medfilt1d(arr, k=15):
+    pad = k // 2
+    padded = np.pad(arr, pad, mode="edge")
+    return np.median(sliding_window_view(padded, k), axis=-1)
+
+
+def build_exact_lumen_geometry(bg):
     """
-    Detect cells in a single frame using:
-    1. Background subtraction (masked to channel corridor if provided)
-    2. Otsu thresholding (adaptive per frame, with noise floor)
-    3. Connected components with watershed for touching cells
-    4. Morphological + channel centerline Y-gate filtering
-
-    Returns: list of (center_x, center_y, area, circularity)
-    """
-    # 1. Background subtraction (static contrast)
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
-    diff = gray - background
-    diff = np.clip(diff, -50, 50)  # Limit outliers
-    diff = np.abs(diff)
-
-    # Zero out outer bath before Otsu & Distance Transform so bath cells
-    # do not skew the frame threshold or dist.max()
-    if corridor_mask is not None:
-        diff = diff * corridor_mask
-
-    # 2. Edge-preserving blur
-    diff_uint8 = cv2.convertScaleAbs(diff.astype(np.uint8), alpha=1.5, beta=0)
-    diff_blur = cv2.bilateralFilter(diff_uint8, d=9, sigmaColor=75, sigmaSpace=3)
-
-    # 3. Otsu thresholding (auto-threshold per frame, with minimum noise floor of 8)
-    otsu_val, thresh = cv2.threshold(
-        diff_blur.astype(np.uint8), 0, 255,
-        cv2.THRESH_BINARY + cv2.THRESH_OTSU
-    )
-    if otsu_val < 8:
-        _, thresh = cv2.threshold(diff_blur.astype(np.uint8), 8, 255, cv2.THRESH_BINARY)
-    if corridor_mask is not None:
-        thresh = cv2.bitwise_and(thresh, corridor_mask)
-
-    # 4. Morphological operations
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
-    thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=1)
-
-    # 5. Distance transform + watershed for touching cells
-    dist = cv2.distanceTransform(thresh, cv2.DIST_L2, 5)
-    if dist.max() <= 0:
-        return []
-    _, dist_thresh = cv2.threshold(
-        dist, 0.5 * dist.max(), 255, 0
-    )
-    dist_thresh = dist_thresh.astype(np.uint8)
-
-    # Mark sure background (outside channel)
-    sure_bg = cv2.distanceTransform(255 - thresh, cv2.DIST_L2, 5)
-    _, sure_bg_thresh = cv2.threshold(
-        sure_bg, 2, 255, 0
-    )
-    sure_bg_thresh = sure_bg_thresh.astype(np.uint8)
-
-    # Mark sure foreground (cells)
-    sure_fg = cv2.threshold(dist, 0.3 * dist.max(), 255, 0)[1].astype(np.uint8)
-
-    # Mark regions of interest (unknown)
-    unknown = cv2.subtract(sure_bg_thresh, sure_fg)
-    unknown = cv2.dilate(unknown, kernel, iterations=1)
-    unknown = cv2.erode(unknown, kernel, iterations=1)
-
-    # Watershed markers
-    _, markers = cv2.connectedComponents(sure_fg)
-    markers = markers + 1
-    markers[unknown == 255] = 0
-
-    # Apply watershed
-    thresh_color = cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
-    cv2.watershed(thresh_color, markers)
-
-    # Extract cell contours in a single pass over the foreground mask.
-    # Note: connectedComponents(sure_fg) + 1 assigns label 1 to the outer background
-    # and labels >= 2 to the foreground cell markers (with -1 as watershed dams).
-    # Therefore, cell foreground is strictly (markers > 1), NOT (markers > 0)!
-    fg_mask = (markers > 1).astype(np.uint8)
-    cnts, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    label_to_cnt = {}
-    for cnt in cnts:
-        x, y, w, h = cv2.boundingRect(cnt)
-        roi_markers = markers[y:y+h, x:x+w]
-        labels_in_roi = [int(l) for l in np.unique(roi_markers) if l > 1]
-        if len(labels_in_roi) == 1:
-            lbl = labels_in_roi[0]
-            if lbl not in label_to_cnt:
-                label_to_cnt[lbl] = cnt
-        else:
-            # If two watershed labels touch diagonally (8-connected), extract each within its small ROI box
-            for lbl in labels_in_roi:
-                if lbl in label_to_cnt:
-                    continue
-                sub_mask = (roi_markers == lbl).astype(np.uint8)
-                sub_cnts, _ = cv2.findContours(sub_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                if sub_cnts:
-                    c = sub_cnts[0].copy()
-                    c[:, 0, 0] += x
-                    c[:, 0, 1] += y
-                    label_to_cnt[lbl] = c
-
-    cell_data = []
-    for label in sorted(label_to_cnt.keys()):
-        cnt = label_to_cnt[label]
-
-        # Filter by area (remove noise)
-        area = cv2.contourArea(cnt)
-        if area < 20 or area > 5000:  # Adjust thresholds based on your data
-            continue
-
-        # Compute centroid
-        M = cv2.moments(cnt)
-        if M["m00"] == 0:
-            continue
-        cx = int(M["m10"] / M["m00"])
-        cy = int(M["m01"] / M["m00"])
-
-        # Check if inside channel (verify both X span AND perpendicular Y distance to centerline!)
-        bounds = get_local_channel_bounds(width_profile_dict, float(cx))
-        if bounds is None:
-            continue
-        local_y, local_width, cos_theta = bounds
-        perp_dist = abs(float(cy) - local_y) * cos_theta
-        max_allowed_dist = (0.5 * local_width) + float(y_margin)
-        if perp_dist > max_allowed_dist:
-            continue
-
-        # Compute circularity
-        perimeter = cv2.arcLength(cnt, True)
-        if perimeter == 0:
-            continue
-        circularity = 4 * np.pi * area / (perimeter * perimeter)
-
-        cell_data.append((cx, cy, area, circularity))
-
-    return cell_data
-
-
-def get_local_channel_bounds(width_profile, x_coord):
-    """Interpolate channel centerline Y and width at x_coord. Returns (y_center, width_px, cos_theta)."""
-    if not width_profile:
-        return None
-
-    xs = [p["x"] for p in width_profile]
-    ys = [p["y"] for p in width_profile]
-    widths = [p["width_px"] for p in width_profile]
-
-    if x_coord < xs[0] or x_coord > xs[-1]:
-        return None
-
-    # Estimate slope for perpendicular distance projection
-    dx_total = xs[-1] - xs[0]
-    slope = (ys[-1] - ys[0]) / dx_total if dx_total > 0 else 0.0
-    cos_theta = 1.0 / np.sqrt(1.0 + slope * slope)
-
-    # Linear interpolation
-    for i in range(len(xs) - 1):
-        if xs[i] <= x_coord <= xs[i + 1]:
-            span = xs[i + 1] - xs[i]
-            t = (x_coord - xs[i]) / span if span > 0 else 0.0
-            y_c = ys[i] + t * (ys[i + 1] - ys[i])
-            w = widths[i] + t * (widths[i + 1] - widths[i])
-            return y_c, w, cos_theta
-
-    return None
-
-
-def get_local_width(width_profile, x_coord):
-    """Interpolate channel width at x position (backwards-compatible helper)."""
-    res = get_local_channel_bounds(width_profile, x_coord)
-    return res[1] if res is not None else None
-
-
-def build_channel_corridor_mask(shape_hw, width_profile, y_margin=12.0):
-    """Build a binary uint8 mask (0 or 1) covering the channel lumen + margin along the width profile."""
-    if not width_profile:
-        return None
-    h, w = shape_hw[:2]
-    mask = np.zeros((h, w), dtype=np.uint8)
-    xs = [p["x"] for p in width_profile]
-    ys = [p["y"] for p in width_profile]
-    widths = [p["width_px"] for p in width_profile]
-
-    dx_total = xs[-1] - xs[0]
-    slope = (ys[-1] - ys[0]) / dx_total if dx_total > 0 else 0.0
-    cos_theta = 1.0 / np.sqrt(1.0 + slope * slope)
-
-    x_min = max(0, int(np.floor(xs[0])))
-    x_max = min(w - 1, int(np.ceil(xs[-1])))
-    x_grid = np.arange(x_min, x_max + 1, dtype=np.float64)
-    y_centers = np.interp(x_grid, xs, ys)
-    w_interp = np.interp(x_grid, xs, widths)
-    half_band_y = (0.5 * w_interp + float(y_margin)) / max(cos_theta, 1e-6)
-
-    for idx, x_val in enumerate(x_grid.astype(int)):
-        y0 = max(0, int(np.floor(y_centers[idx] - half_band_y[idx])))
-        y1 = min(h, int(np.ceil(y_centers[idx] + half_band_y[idx])) + 1)
-        mask[y0:y1, x_val] = 1
-    return mask
-
-
-# ====================================================================
-# TRACKING: Kalman Filter + Hungarian Algorithm
-# ====================================================================
-
-def _create_kalman_filter(cx, cy):
-    """Initialize a 4-state (x, y, vx, vy), 2-measurement (x, y) OpenCV Kalman filter."""
-    kf = cv2.KalmanFilter(4, 2)
-    kf.measurementMatrix = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], dtype=np.float32)
-    kf.transitionMatrix = np.array(
-        [[1, 0, 1, 0], [0, 1, 0, 1], [0, 0, 1, 0], [0, 0, 0, 1]],
-        dtype=np.float32
-    )
-    kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.03
-    kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 10.0
-    kf.errorCovPost = np.eye(4, dtype=np.float32)
-    state = np.array([[float(cx)], [float(cy)], [0.0], [0.0]], dtype=np.float32)
-    kf.statePre = state.copy()
-    kf.statePost = state.copy()
-    return kf
-
-
-class CellTracker:
-    def __init__(self, max_age=30, min_hits=3):
-        """
-        Track cells across frames using Kalman filter.
-
-        Args:
-            max_age: Maximum frames to keep a track without detection
-            min_hits: Minimum detections to create a new track
-        """
-        self.max_age = max_age
-        self.min_hits = min_hits
-
-        self.tracks = {}  # track_id -> {"last_seen": frame, "state": Kalman, "hits": 1, "path": [...]}
-        self.completed_paths = {}  # track_id -> full path [(frame, cx, cy, area, circ), ...] for confirmed tracks
-        self.next_track_id = 0
-        self.frame_num = 0
-
-    def predict(self):
-        """Predict all active tracks."""
-        for tid, track in self.tracks.items():
-            if track["state"] is None:
-                continue
-            track["state"].predict()
-
-    def associate(self, detections):
-        """
-        Assign detections to tracks using Hungarian algorithm.
-
-        Args:
-            detections: list of (cx, cy, area, circularity)
-
-        Returns:
-            (matched_tracks, matched_dets, untracked_detections, untracked_tracks)
-        """
-        track_indices = list(self.tracks.keys())
-        det_indices = list(range(len(detections)))
-        n_tracks = len(track_indices)
-        n_dets = len(detections)
-
-        # Handle edge cases
-        if n_tracks == 0 or n_dets == 0:
-            return [], [], list(det_indices), list(track_indices)
-
-        # Filter to tracks with valid Kalman states only
-        valid_tracks = [tid for tid in track_indices if self.tracks[tid]["state"] is not None]
-        if not valid_tracks:
-            return [], [], list(det_indices), list(track_indices)
-
-        # Compute distances (squared Euclidean)
-        n_valid = len(valid_tracks)
-        cost_matrix = np.full((n_valid, n_dets), np.inf)
-
-        for i, tid in enumerate(valid_tracks):
-            track = self.tracks[tid]
-            pred_pos = track["state"].statePre[:2].reshape(-1)
-            for j, (cx, cy, area, circ) in enumerate(detections):
-                dist = (cx - float(pred_pos[0]))**2 + (cy - float(pred_pos[1]))**2
-                cost_matrix[i, j] = dist
-
-        # Hungarian algorithm (with pure-NumPy fallback if scipy is absent)
-        try:
-            from scipy.optimize import linear_sum_assignment
-            row_ind, col_ind = linear_sum_assignment(cost_matrix)
-        except ImportError:
-            row_ind, col_ind = [], []
-            work = cost_matrix.copy()
-            for _ in range(min(n_valid, n_dets)):
-                r, c = np.unravel_index(np.argmin(work), work.shape)
-                if not np.isfinite(work[r, c]):
-                    break
-                row_ind.append(int(r))
-                col_ind.append(int(c))
-                work[r, :] = np.inf
-                work[:, c] = np.inf
-
-        # Filter matches (ignore high cost)
-        max_cost = 100  # pixels^2 (10 px radius)
-        matched_tracks = []
-        matched_dets = []
-
-        for i, j in zip(row_ind, col_ind):
-            if cost_matrix[i, j] < max_cost:
-                tid = valid_tracks[i]
-                matched_tracks.append(tid)
-                matched_dets.append(det_indices[j])
-
-        return (
-            matched_tracks,
-            matched_dets,
-            list(set(det_indices) - set(matched_dets)),
-            list(set(track_indices) - set(matched_tracks))
-        )
-
-    def update(self, detections, matched_tracks, matched_dets):
-        """Update tracks with new detections."""
-        for i, tid in enumerate(matched_tracks):
-            det_idx = matched_dets[i]
-            cx, cy, area, circ = detections[det_idx]
-
-            track = self.tracks[tid]
-            if track["state"] is None:
-                track["state"] = _create_kalman_filter(cx, cy)
-                track["hits"] = 1
-                track["last_seen"] = self.frame_num
-                track["path"] = [(self.frame_num, cx, cy, area, circ)]
-            else:
-                measurement = np.array([[float(cx)], [float(cy)]], dtype=np.float32)
-                track["state"].correct(measurement)
-                track["hits"] += 1
-                track["last_seen"] = self.frame_num
-                track["path"].append((self.frame_num, cx, cy, area, circ))
-                if track["hits"] >= self.min_hits:
-                    self.completed_paths[tid] = track["path"]
-
-        # Remove tracks that have aged out
-        tracks_to_remove = []
-        for tid, track in self.tracks.items():
-            if track["last_seen"] >= self.frame_num - self.max_age:
-                track["age"] = self.frame_num - track["last_seen"]
-            else:
-                tracks_to_remove.append(tid)
-
-        for tid in tracks_to_remove:
-            del self.tracks[tid]
-
-    def add_new_tracks(self, untracked_dets, detections):
-        """Create new tracks with initialized Kalman filters for untracked detections."""
-        for det_idx in untracked_dets:
-            cx, cy, area, circ = detections[det_idx]
-
-            self.tracks[self.next_track_id] = {
-                "state": _create_kalman_filter(cx, cy),
-                "hits": 1,
-                "last_seen": self.frame_num,
-                "path": [(self.frame_num, cx, cy, area, circ)]
-            }
-            self.next_track_id += 1
-
-    def process_frame(self, detections):
-        """
-        Process a single frame: predict, associate, update.
-
-        Args:
-            detections: list of (cx, cy, area, circularity)
-
-        Returns:
-            list of (track_id, cx, cy, area, circularity) for all active tracks
-        """
-        self.frame_num += 1
-
-        # Predict all tracks
-        self.predict()
-
-        # Associate detections to tracks
-        matched_tracks, matched_dets, unmatched_dets, unmatched_tracks = self.associate(detections)
-
-        # Update tracks
-        self.update(detections, matched_tracks, matched_dets)
-
-        # Add new tracks
-        self.add_new_tracks(unmatched_dets, detections)
-
-        # Collect active tracks that were updated on this frame and reached min_hits
-        results = []
-        for tid, track in self.tracks.items():
-            if track["hits"] < self.min_hits or track["last_seen"] != self.frame_num:
-                continue
-            last = track["path"][-1]
-            frame, cx, cy, area, circ = last
-            results.append((tid, cx, cy, area, circ))
-
-        return results
-
-
-# ====================================================================
-# BIOMECHANICS CALCULATION
-# ====================================================================
-
-def compute_biomarker(track_path, width_profile, track_id=None):
-    """
-    Compute biomechanical metrics for a single cell track.
+    Trace the top and bottom dark glass walls across the ENTIRE frame width (x = 0..W-1),
+    including the left flare (x < 115), narrow constriction (115 <= x <= 1165),
+    and right flare (x > 1165).
 
     Returns:
-        dict with:
-          - velocity_mean (px/frame)
-          - velocity_max (px/frame)
-          - area_mean (px²)
-          - area_min (px²)
-          - circularity_mean
-          - ADI (Area Deformation Index)
-          - elongation_ratio
+      lumen_mask (uint8 HxW, 255 inside lumen, 0 on walls & bath),
+      top_wall (float array W),
+      bot_wall (float array W),
+      slope (float),
+      intercept (float)
     """
-    if len(track_path) < 2:
+    h, w = bg.shape[:2]
+
+    # 1. Sigma-clipped linear fit on the central bore (x = 120 .. w-120)
+    xs_fit = np.arange(120, w - 120, dtype=np.float64)
+    ys_fit = np.array([bg[:, int(x)].argmin() for x in xs_fit], dtype=np.float64)
+    for _ in range(4):
+        A = np.polyfit(xs_fit, ys_fit, 1)
+        r = ys_fit - np.polyval(A, xs_fit)
+        keep = np.abs(r) < 2.0 * r.std()
+        if keep.sum() < 20:
+            break
+        xs_fit, ys_fit = xs_fit[keep], ys_fit[keep]
+    A = np.polyfit(xs_fit, ys_fit, 1)
+    slope, intercept = float(A[0]), float(A[1])
+
+    # 2. Locate upper and lower dark glass wall centers in every column x = 0..w-1
+    top_wall = np.zeros(w, dtype=np.float64)
+    bot_wall = np.zeros(w, dtype=np.float64)
+
+    for x in range(w):
+        yc = slope * x + intercept
+        # Flares widen up to ~28 px from centerline; narrow bore is within ~9 px
+        max_search = 28 if (x < 115 or x > 1165) else 9
+        y_lo = max(0, int(round(yc - max_search)))
+        y_hi = min(h - 1, int(round(yc + max_search)))
+        y_mid = np.clip(int(round(yc)), y_lo + 1, y_hi - 1)
+
+        top_slice = bg[y_lo:y_mid, x]
+        bot_slice = bg[y_mid + 1:y_hi + 1, x]
+
+        top_wall[x] = y_lo + int(np.argmin(top_slice)) if top_slice.size > 0 else yc - 3.5
+        bot_wall[x] = (y_mid + 1) + int(np.argmin(bot_slice)) if bot_slice.size > 0 else yc + 3.5
+
+    # 3. Median-filter wall positions to ignore dirt specks stuck on glass
+    top_smooth = _medfilt1d(top_wall, k=15)
+    bot_smooth = _medfilt1d(bot_wall, k=15)
+
+    # 4. Build interior lumen mask (peel 1.0 px inside dark wall centers so wall shimmer is excluded,
+    # while guaranteeing at least a 3 px core in the narrowest bore so squeezed cells are detected)
+    lumen_mask = np.zeros((h, w), dtype=np.uint8)
+    for x in range(w):
+        yc = 0.5 * (top_smooth[x] + bot_smooth[x])
+        half_w = max(2.0, 0.5 * (bot_smooth[x] - top_smooth[x]) - 1.0)
+        y0 = max(0, int(np.floor(yc - half_w)))
+        y1 = min(h, int(np.ceil(yc + half_w)) + 1)
+        lumen_mask[y0:y1, x] = 255
+
+    return lumen_mask, top_smooth, bot_smooth, slope, intercept
+
+
+# ====================================================================
+# CELL DETECTION INSIDE THE PASSAGE LUMEN
+# ====================================================================
+
+def detect_cells_in_passage(frame, background, lumen_mask, roi_y_bounds, diff_thresh=11.0):
+    """
+    Detect RBCs strictly inside the microfluidic passage (flares + constriction bore).
+
+    Returns list of dicts:
+      {
+        "cx": float, "cy": float,
+        "bbox": (x, y, w, h),
+        "area": float,
+        "circularity": float,
+        "elongation": float,
+        "peak_diff": float
+      }
+    """
+    y_min, y_max = roi_y_bounds
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+
+    # Work only on the horizontal strip containing the tilted tube (5x faster than full 1280x480)
+    gray_roi = gray[y_min:y_max, :].astype(np.float32)
+    bg_roi = background[y_min:y_max, :]
+    mask_roi = lumen_mask[y_min:y_max, :]
+
+    # Absolute contrast difference against static temporal median background
+    diff = np.abs(gray_roi - bg_roi)
+    diff = cv2.GaussianBlur(diff, (3, 3), 0)
+
+    # Zero out everything outside the interior tube lumen (excludes bath + dark wall ridges)
+    diff[mask_roi == 0] = 0.0
+
+    # Adaptive + floor threshold: only trigger when a real cell perturbation is inside the lumen
+    max_val = float(diff.max())
+    if max_val < diff_thresh:
+        return []
+
+    # Threshold at max(diff_thresh, 0.35 * local_peak) to segment the cell body cleanly
+    binary = (diff >= diff_thresh).astype(np.uint8) * 255
+
+    # Connect slightly separated bright/dark phase rings of the same cell along the channel
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 3))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    cnts, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    detections = []
+
+    for cnt in cnts:
+        area = float(cv2.contourArea(cnt))
+        bx, by_rel, bw, bh = cv2.boundingRect(cnt)
+        box_area = float(bw * bh)
+
+        # In the narrow constriction (width ~4 px), a squeezed cell may have contourArea ~ 10-15 px^2
+        # and bounding box ~ 8x4 px. Reject tiny 1-2 px sensor specks and giant artifacts.
+        if area < 8.0 and box_area < 14.0:
+            continue
+        if area > 4500.0:
+            continue
+
+        # Check peak intensity difference inside this blob to reject weak wall vibration
+        blob_patch = diff[by_rel:by_rel + bh, bx:bx + bw]
+        peak_diff = float(blob_patch.max()) if blob_patch.size > 0 else 0.0
+        if peak_diff < diff_thresh + 2.0:
+            continue
+
+        M = cv2.moments(cnt)
+        if M["m00"] > 0:
+            cx = float(M["m10"] / M["m00"])
+            cy = float(M["m01"] / M["m00"]) + y_min
+        else:
+            cx = float(bx + 0.5 * bw)
+            cy = float(by_rel + 0.5 * bh + y_min)
+
+        by = int(by_rel + y_min)
+        effective_area = max(area, 0.75 * box_area)
+
+        perimeter = float(cv2.arcLength(cnt, True))
+        circularity = float(4.0 * np.pi * area / (perimeter * perimeter)) if perimeter > 0 else 0.5
+        circularity = float(np.clip(circularity, 0.05, 1.0))
+
+        long_side = float(max(bw, bh))
+        short_side = float(max(1, min(bw, bh)))
+        elongation = long_side / short_side
+
+        detections.append({
+            "cx": cx,
+            "cy": cy,
+            "bbox": (int(bx), int(by), int(bw), int(bh)),
+            "area": effective_area,
+            "circularity": circularity,
+            "elongation": elongation,
+            "peak_diff": peak_diff,
+        })
+
+    return detections
+
+
+# ====================================================================
+# PASSAGE TRACKER (Follows cells continuously from Entrance to Exit)
+# ====================================================================
+
+class PassageCellTracker:
+    """
+    Multi-object tracker specialized for high-speed microfluidic channel passages.
+    Uses constant-velocity Kalman prediction + anisotropic channel-axis association
+    so fast cells accelerating into the constriction bore maintain a single ID.
+    """
+    def __init__(self, slope, max_age=15, min_hits=3, max_step_px=75.0):
+        self.slope = slope
+        self.max_age = max_age
+        self.min_hits = min_hits
+        self.max_step_px = max_step_px
+
+        # Unit vector along channel passage
+        norm = np.sqrt(1.0 + slope * slope)
+        self.ux = 1.0 / norm
+        self.uy = slope / norm
+
+        self.tracks = {}
+        self.finished_tracks = {}
+        self.next_id = 1
+
+    def _init_kf(self, cx, cy, vx=0.0, vy=0.0):
+        kf = cv2.KalmanFilter(4, 2)
+        kf.measurementMatrix = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], dtype=np.float32)
+        kf.transitionMatrix = np.array(
+            [[1, 0, 1, 0], [0, 1, 0, 1], [0, 0, 1, 0], [0, 0, 0, 1]],
+            dtype=np.float32
+        )
+        kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.25
+        kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 4.0
+        kf.errorCovPost = np.eye(4, dtype=np.float32) * 10.0
+        state = np.array([[float(cx)], [float(cy)], [float(vx)], [float(vy)]], dtype=np.float32)
+        kf.statePre = state.copy()
+        kf.statePost = state.copy()
+        return kf
+
+    def step(self, frame_idx, detections):
+        # 1. Predict active tracks forward
+        for tid, tr in self.tracks.items():
+            tr["kf"].predict()
+
+        track_ids = list(self.tracks.keys())
+        n_t = len(track_ids)
+        n_d = len(detections)
+
+        matched_t = []
+        matched_d = []
+
+        if n_t > 0 and n_d > 0:
+            cost = np.full((n_t, n_d), np.inf, dtype=np.float64)
+            for i, tid in enumerate(track_ids):
+                tr = self.tracks[tid]
+                pred = tr["kf"].statePre.reshape(-1)
+                px, py = float(pred[0]), float(pred[1])
+                last_x, last_y = tr["path"][-1]["cx"], tr["path"][-1]["cy"]
+                dt = max(1, frame_idx - tr["last_frame"])
+
+                for j, d in enumerate(detections):
+                    # Distance from Kalman prediction
+                    dx_pred = d["cx"] - px
+                    dy_pred = d["cy"] - py
+                    # Project error along channel axis (s) and perpendicular to channel (n)
+                    ds = abs(dx_pred * self.ux + dy_pred * self.uy)
+                    dn = abs(-dx_pred * self.uy + dy_pred * self.ux)
+
+                    # Raw displacement from last observed position
+                    raw_dist = np.hypot(d["cx"] - last_x, d["cy"] - last_y) / float(dt)
+
+                    # Penalize perpendicular jumps heavily (cells cannot jump through glass walls)
+                    if dn <= 18.0 and (ds <= self.max_step_px or raw_dist <= self.max_step_px):
+                        cost[i, j] = ds + 3.5 * dn
+
+            # Solve assignment
+            try:
+                from scipy.optimize import linear_sum_assignment
+                r_ind, c_ind = linear_sum_assignment(cost)
+            except ImportError:
+                r_ind, c_ind = [], []
+                work = cost.copy()
+                for _ in range(min(n_t, n_d)):
+                    r, c = np.unravel_index(np.argmin(work), work.shape)
+                    if not np.isfinite(work[r, c]):
+                        break
+                    r_ind.append(int(r))
+                    c_ind.append(int(c))
+                    work[r, :] = np.inf
+                    work[:, c] = np.inf
+
+            for r, c in zip(r_ind, c_ind):
+                if cost[r, c] < self.max_step_px:
+                    matched_t.append(track_ids[r])
+                    matched_d.append(c)
+
+        # 2. Update matched tracks
+        for tid, d_idx in zip(matched_t, matched_d):
+            d = detections[d_idx]
+            tr = self.tracks[tid]
+            dt = max(1, frame_idx - tr["last_frame"])
+            prev = tr["path"][-1]
+            inst_vel = float(np.hypot(d["cx"] - prev["cx"], d["cy"] - prev["cy"]) / float(dt))
+
+            meas = np.array([[float(d["cx"])], [float(d["cy"])]], dtype=np.float32)
+            tr["kf"].correct(meas)
+            tr["hits"] += 1
+            tr["last_frame"] = frame_idx
+
+            # Running ADI (min_area / mean_area so far)
+            areas_so_far = [p["area"] for p in tr["path"]] + [d["area"]]
+            running_adi = float(np.min(areas_so_far) / max(1.0, np.mean(areas_so_far)))
+
+            tr["path"].append({
+                "frame": frame_idx,
+                "track_id": tid,
+                "cx": d["cx"],
+                "cy": d["cy"],
+                "bbox": d["bbox"],
+                "area": d["area"],
+                "circularity": d["circularity"],
+                "elongation": d["elongation"],
+                "velocity": inst_vel,
+                "ADI_running": running_adi,
+            })
+
+        # 3. Create new tracks for unmatched detections
+        unmatched_d = set(range(n_d)) - set(matched_d)
+        for d_idx in sorted(unmatched_d):
+            d = detections[d_idx]
+            tid = self.next_id
+            self.next_id += 1
+            self.tracks[tid] = {
+                "kf": self._init_kf(d["cx"], d["cy"]),
+                "hits": 1,
+                "last_frame": frame_idx,
+                "path": [{
+                    "frame": frame_idx,
+                    "track_id": tid,
+                    "cx": d["cx"],
+                    "cy": d["cy"],
+                    "bbox": d["bbox"],
+                    "area": d["area"],
+                    "circularity": d["circularity"],
+                    "elongation": d["elongation"],
+                    "velocity": 0.0,
+                    "ADI_running": 1.0,
+                }],
+            }
+
+        # 4. Retire aged-out tracks
+        to_del = []
+        for tid, tr in self.tracks.items():
+            if frame_idx - tr["last_frame"] > self.max_age:
+                self.finished_tracks[tid] = tr["path"]
+                to_del.append(tid)
+        for tid in to_del:
+            del self.tracks[tid]
+
+    def finalize_all(self, min_hits=3, min_net_travel_px=15.0):
+        """
+        Return all valid moving cell tracks that achieved at least min_hits and
+        actually traveled along the passage (rejects static wall specks).
+        """
+        all_raw = dict(self.finished_tracks)
+        for tid, tr in self.tracks.items():
+            all_raw[tid] = tr["path"]
+
+        valid_tracks = {}
+        new_id = 1
+        for old_tid in sorted(all_raw.keys()):
+            path = all_raw[old_tid]
+            if len(path) < min_hits:
+                continue
+            # Check net travel distance along passage (start to end of track)
+            dx = path[-1]["cx"] - path[0]["cx"]
+            dy = path[-1]["cy"] - path[0]["cy"]
+            net_travel = float(np.hypot(dx, dy))
+            max_span_x = float(max(p["cx"] for p in path) - min(p["cx"] for p in path))
+            if net_travel < min_net_travel_px and max_span_x < min_net_travel_px:
+                continue
+
+            # Re-index cleanly as Cell #1, #2, ...
+            for p in path:
+                p["track_id"] = new_id
+            valid_tracks[new_id] = path
+            new_id += 1
+
+        return valid_tracks
+
+
+# ====================================================================
+# BIOMECHANICS COMPUTATION
+# ====================================================================
+
+def compute_biomarker(track_id, path):
+    if len(path) < 2:
         return None
 
-    # Extract time series
-    frames = [p[0] for p in track_path]
-    areas = [p[3] for p in track_path]
-    circs = [p[4] for p in track_path]
-    positions = [(p[1], p[2]) for p in track_path]
+    frames = [p["frame"] for p in path]
+    areas = [p["area"] for p in path]
+    circs = [p["circularity"] for p in path]
+    elongs = [p["elongation"] for p in path]
+    vels = [p["velocity"] for p in path[1:]]
 
-    # 1. Velocity (per-frame displacement, properly divided by frame gap dt)
-    velocities = []
-    for i in range(1, len(positions)):
-        dt = max(1, frames[i] - frames[i - 1])
-        dx = positions[i][0] - positions[i - 1][0]
-        dy = positions[i][1] - positions[i - 1][1]
-        v = np.sqrt(dx**2 + dy**2) / float(dt)
-        velocities.append(v)
+    area_mean = float(np.mean(areas))
+    area_min = float(np.min(areas))
+    adi = area_min / area_mean if area_mean > 0 else 0.0
 
-    if not velocities:
-        return None
-
-    velocity_mean = np.mean(velocities)
-    velocity_max = np.max(velocities)
-
-    # 2. Area metrics
-    area_mean = np.mean(areas)
-    area_min = np.min(areas)
-
-    # 3. Circularity metrics
-    circ_mean = np.mean(circs)
-    circ_min = np.min(circs)
-
-    # 4. ADI (Area Deformation Index)
-    # ADI = area_min / area_mean (normalized to [0,1])
-    # Lower = more deformation
-    ADI = area_min / area_mean if area_mean > 0 else 0
-
-    # 5. Shape recovery (post-constriction)
-    # Check if cell recovers shape after constriction
     shape_recovery = None
-    if len(track_path) >= 5:
-        mid_circ = np.mean(circs[len(circs)//3:2*len(circs)//3])
-        post_circ = np.mean(circs[2*len(circs)//3:])
-        shape_recovery = post_circ / mid_circ if mid_circ > 0 else None
+    if len(path) >= 5:
+        mid_circ = float(np.mean(circs[len(circs) // 3: 2 * len(circs) // 3]))
+        post_circ = float(np.mean(circs[2 * len(circs) // 3:]))
+        if mid_circ > 0:
+            shape_recovery = post_circ / mid_circ
+
+    x_start, x_end = float(path[0]["cx"]), float(path[-1]["cx"])
+    travel_px = float(np.hypot(path[-1]["cx"] - path[0]["cx"], path[-1]["cy"] - path[0]["cy"]))
 
     return {
-        "track_id": int(track_id) if track_id is not None else int(track_path[0][0]),
-        "velocity_mean": float(velocity_mean),
-        "velocity_max": float(velocity_max),
-        "area_mean": float(area_mean),
-        "area_min": float(area_min),
-        "circularity_mean": float(circ_mean),
-        "circularity_min": float(circ_min),
-        "ADI": float(ADI),
+        "track_id": int(track_id),
+        "entrance_frame": int(frames[0]),
+        "exit_frame": int(frames[-1]),
+        "track_length_frames": len(path),
+        "duration_ms": float((frames[-1] - frames[0]) / 10.0),  # 0.1 ms/frame at 10,000 fps
+        "x_start_px": round(x_start, 1),
+        "x_end_px": round(x_end, 1),
+        "net_travel_px": round(travel_px, 1),
+        "velocity_mean": float(np.mean(vels)) if vels else 0.0,
+        "velocity_max": float(np.max(vels)) if vels else 0.0,
+        "area_mean": area_mean,
+        "area_min": area_min,
+        "circularity_mean": float(np.mean(circs)),
+        "circularity_min": float(np.min(circs)),
+        "elongation_max": float(np.max(elongs)),
+        "ADI": float(adi),
         "shape_recovery": float(shape_recovery) if shape_recovery is not None else None,
-        "track_length_frames": len(track_path),
-        "entrance_frame": frames[0],
-        "exit_frame": frames[-1],
-        "duration_ms": (frames[-1] - frames[0]) / 10  # 0.1ms/frame at 10kHz
     }
+
+
+# ====================================================================
+# DIRECT ANNOTATED VIDEO RENDERER (Bounding Box + Biomechanics HUD)
+# ====================================================================
+
+def _cell_color_bgr(track_id):
+    palette = [
+        (60, 255, 100),   # Neon green
+        (0, 215, 255),    # Gold / amber
+        (255, 190, 40),   # Cyan-blue
+        (180, 105, 255),  # Pink-magenta
+        (80, 160, 255),   # Orange
+    ]
+    return palette[(track_id - 1) % len(palette)]
+
+
+def render_annotated_videos(
+    video_path,
+    start_frame,
+    frames_to_run,
+    top_wall,
+    bot_wall,
+    valid_tracks,
+    biomarkers_by_id,
+    out_dir,
+    playback_fps=20.0
+):
+    """
+    Render the actual microscopy video with:
+    - Subtle channel wall guide lines
+    - Tight bounding box around each tracked cell in the passage
+    - Trajectory trail from the entrance of the passage
+    - Callout HUD box next to the cell showing:
+        CELL #ID | Vel: X.X px/f | Area: XX px^2 | Circ: 0.XX | ADI: 0.XX
+    """
+    full_mp4 = os.path.join(out_dir, "tracked_cells_video.mp4")
+    active_mp4 = os.path.join(out_dir, "active_passages_only.mp4")
+    best_png = os.path.join(out_dir, "tracked_cell_snapshot.png")
+
+    # Map frame_idx -> list of track point dicts
+    by_frame = defaultdict(list)
+    history_by_track = defaultdict(list)
+    for tid, path in valid_tracks.items():
+        for pt in path:
+            by_frame[pt["frame"]].append(pt)
+
+    cap = cv2.VideoCapture(video_path)
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1280
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 480
+    if start_frame > 0:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer_full = cv2.VideoWriter(full_mp4, fourcc, playback_fps, (w, h))
+    writer_active = cv2.VideoWriter(active_mp4, fourcc, playback_fps, (w, h))
+
+    # Precompute subtle wall polylines (every 8 px)
+    xs_wall = np.arange(0, w, 8)
+    top_pts = np.column_stack([xs_wall, top_wall[xs_wall]]).astype(np.int32)
+    bot_pts = np.column_stack([xs_wall, bot_wall[xs_wall]]).astype(np.int32)
+
+    active_frame_count = 0
+    best_frame_img = None
+    best_frame_score = -1
+
+    for offset in range(frames_to_run):
+        f_idx = start_frame + offset
+        ok, frame = cap.read()
+        if not ok:
+            break
+
+        vis = frame.copy() if frame.ndim == 3 else cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+
+        # Draw faint dark-green guide along the calibrated glass walls
+        cv2.polylines(vis, [top_pts], False, (70, 130, 70), 1, cv2.LINE_AA)
+        cv2.polylines(vis, [bot_pts], False, (70, 130, 70), 1, cv2.LINE_AA)
+
+        frame_dets = by_frame.get(f_idx, [])
+        for d in frame_dets:
+            tid = d["track_id"]
+            color = _cell_color_bgr(tid)
+            bx, by, bw, bh = d["bbox"]
+            cx_i, cy_i = int(round(d["cx"])), int(round(d["cy"]))
+            history_by_track[tid].append((cx_i, cy_i))
+
+            # 1. Draw full passage trajectory trail up to current frame
+            trail = history_by_track[tid]
+            if len(trail) >= 2:
+                cv2.polylines(vis, [np.array(trail, np.int32)], False, color, 2, cv2.LINE_AA)
+                # Mark entrance point
+                cv2.circle(vis, trail[0], 3, (0, 255, 255), -1, cv2.LINE_AA)
+
+            # 2. Draw padded bounding box with corner brackets around the cell
+            pad = 6
+            x0, y0 = max(0, bx - pad), max(0, by - pad)
+            x1, y1 = min(w - 1, bx + bw + pad), min(h - 1, by + bh + pad)
+            cv2.rectangle(vis, (x0, y0), (x1, y1), color, 2)
+
+            # 3. Draw floating biomechanics HUD card right above/below the bounding box
+            bio = biomarkers_by_id.get(tid, {})
+            adi_val = bio.get("ADI", d["ADI_running"])
+            line1 = f"CELL #{tid}  [x={int(round(d['cx']))}px]"
+            line2 = f"Vel: {d['velocity']:.1f} px/f | Area: {d['area']:.0f} px2"
+            line3 = f"Circ: {d['circularity']:.2f} | ADI: {adi_val:.2f}"
+
+            card_w, card_h = 235, 54
+            card_x = int(np.clip(cx_i - card_w // 2, 8, w - card_w - 8))
+            card_y = y0 - card_h - 10 if y0 > card_h + 25 else y1 + 10
+
+            # Semi-transparent dark HUD background
+            roi_hud = vis[card_y:card_y + card_h, card_x:card_x + card_w]
+            if roi_hud.shape[0] == card_h and roi_hud.shape[1] == card_w:
+                dark_box = np.full_like(roi_hud, 18)
+                vis[card_y:card_y + card_h, card_x:card_x + card_w] = cv2.addWeighted(roi_hud, 0.25, dark_box, 0.75, 0)
+            cv2.rectangle(vis, (card_x, card_y), (card_x + card_w, card_y + card_h), color, 1)
+
+            # Leader line from HUD card to cell bounding box
+            leader_y = card_y + card_h if card_y < y0 else card_y
+            box_anchor_y = y0 if card_y < y0 else y1
+            cv2.line(vis, (cx_i, leader_y), (cx_i, box_anchor_y), color, 1, cv2.LINE_AA)
+
+            cv2.putText(vis, line1, (card_x + 7, card_y + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.44, color, 1, cv2.LINE_AA)
+            cv2.putText(vis, line2, (card_x + 7, card_y + 33), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (235, 235, 235), 1, cv2.LINE_AA)
+            cv2.putText(vis, line3, (card_x + 7, card_y + 48), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 230, 255), 1, cv2.LINE_AA)
+
+            if len(trail) > best_frame_score:
+                best_frame_score = len(trail)
+                best_frame_img = vis.copy()
+
+        # Top status bar
+        cv2.rectangle(vis, (0, 0), (w, 30), (15, 18, 22), -1)
+        status_txt = (
+            f"IISc RBC Passage Tracker | Frame {f_idx} ({f_idx / 10.0:.1f} ms) | "
+            f"Cells in Passage: {len(frame_dets)} | Total Confirmed Cells: {len(valid_tracks)}"
+        )
+        cv2.putText(vis, status_txt, (14, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (240, 240, 240), 1, cv2.LINE_AA)
+
+        writer_full.write(vis)
+        if len(frame_dets) > 0:
+            writer_active.write(vis)
+            active_frame_count += 1
+
+    writer_full.release()
+    writer_active.release()
+    cap.release()
+
+    if best_frame_img is not None:
+        cv2.imwrite(best_png, best_frame_img)
+
+    return full_mp4, active_mp4, best_png, active_frame_count
 
 
 # ====================================================================
@@ -552,11 +644,12 @@ def compute_biomarker(track_path, width_profile, track_id=None):
 # ====================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Stage 3: RBC Detection + Tracking")
-    parser.add_argument("--max-frames", type=int, default=None, help="Optional cap on frames to process (e.g. 500 for quick test)")
+    parser = argparse.ArgumentParser(description="Stage 3: End-to-End RBC Passage Tracking + Video Output")
+    parser.add_argument("--max-frames", type=int, default=500, help="Number of frames to process (default: 500; pass 0 for all 37,274)")
     parser.add_argument("--start-frame", type=int, default=0, help="Frame index to start from (default: 0)")
     parser.add_argument("--video", type=str, default=None, help="Optional override path to .avi file")
-    parser.add_argument("--y-margin", type=float, default=12.0, help="Extra perpendicular half-width margin (px) around channel width profile (default: 12.0)")
+    parser.add_argument("--min-travel", type=float, default=15.0, help="Minimum net travel (px) to keep a cell track (rejects static wall dirt)")
+    parser.add_argument("--diff-thresh", type=float, default=11.0, help="Minimum background-difference intensity inside lumen (default: 11.0)")
     args = parser.parse_args()
 
     if not os.path.isfile(CALIB_FILE) or not os.path.isfile(BG_FILE):
@@ -567,162 +660,198 @@ def main():
     calib = load_calibration()
     background = load_background()
 
-    VIDEO = args.video if args.video else _resolve_video_path(calib.get("video"))
-    fps = calib["fps"]
-    width_profile = calib["width_profile"]
+    video_path = args.video if args.video else _resolve_video_path(calib.get("video"))
+    fps = calib.get("fps", 10000)
 
-    print("=" * 60)
-    print("STAGE 3: DETECTION + TRACKING")
-    print("=" * 60)
-    print(f"Video path : {VIDEO}")
+    print("=" * 68)
+    print("STAGE 3: END-TO-END PASSAGE RBC TRACKING + VIDEO RENDERING")
+    print("=" * 68)
+    print(f"Video path : {video_path}")
     print(f"Output dir : {OUT}")
 
-    # Initialize tracker
-    tracker = CellTracker(max_age=100, min_hits=3)
+    # 1. Build exact full-width interior lumen mask (x = 0..1279, including both flares)
+    lumen_mask, top_wall, bot_wall, slope, intercept = build_exact_lumen_geometry(background)
+    ys_active = np.where(lumen_mask > 0)[0]
+    roi_y_bounds = (max(0, int(ys_active.min()) - 8), min(background.shape[0], int(ys_active.max()) + 8))
+    print(
+        f"Full-width passage lumen calibrated (x=0..{background.shape[1]-1}, y={roi_y_bounds[0]}..{roi_y_bounds[1]}), "
+        f"active lumen = {100.0 * float((lumen_mask > 0).mean()):.2f}% of frame"
+    )
 
-    # Output directories
     out_dir = os.path.join(OUT, "stage3")
     os.makedirs(out_dir, exist_ok=True)
+    cv2.imwrite(os.path.join(out_dir, "exact_lumen_mask.png"), lumen_mask)
 
-    # Trajectory data
-    all_trajectories = []
-    all_biomarkers = []
-
-    # Video capture
-    cap = cv2.VideoCapture(VIDEO)
+    # 2. Scan frames and track cells through the passage
+    cap = cv2.VideoCapture(video_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     if args.start_frame > 0:
         cap.set(cv2.CAP_PROP_POS_FRAMES, args.start_frame)
+
     frames_to_run = total_frames - args.start_frame
-    if args.max_frames is not None:
+    if args.max_frames and args.max_frames > 0:
         frames_to_run = min(frames_to_run, args.max_frames)
 
-    print(f"\nProcessing {frames_to_run} frames (from frame {args.start_frame} of {total_frames}) at {fps} fps...")
-    corridor_mask = build_channel_corridor_mask(background.shape, width_profile, y_margin=args.y_margin)
-    if corridor_mask is not None:
-        active_pct = 100.0 * float(corridor_mask.mean())
-        print(f"Channel corridor mask active: {active_pct:.2f}% of frame area (y_margin=±{args.y_margin:.1f} px)")
+    print(f"\n[1/3] Detecting & tracking cells across {frames_to_run} frames (start={args.start_frame})...")
 
+    tracker = PassageCellTracker(slope=slope, max_age=15, min_hits=3, max_step_px=75.0)
     frame_count = 0
+
     for offset in range(frames_to_run):
-        i = args.start_frame + offset
+        f_idx = args.start_frame + offset
         ok, frame = cap.read()
         if not ok:
             break
         frame_count += 1
 
-        # Detect cells (restricted to channel lumen + flare margin)
-        detections = detect_cells(
-            frame,
-            background,
-            width_profile,
-            y_margin=args.y_margin,
-            corridor_mask=corridor_mask,
-            verbose=(i % 1000 == 0)
+        dets = detect_cells_in_passage(
+            frame, background, lumen_mask, roi_y_bounds, diff_thresh=args.diff_thresh
         )
+        tracker.step(f_idx, dets)
 
-        # Process with tracker
-        results = tracker.process_frame(detections)
-
-        # Store trajectories
-        for tid, cx, cy, area, circ in results:
-            all_trajectories.append({
-                "frame": i,
-                "track_id": tid,
-                "cx": cx,
-                "cy": cy,
-                "area": area,
-                "circularity": circ
-            })
-
-        if (i + 1) % 5000 == 0:
-            print(f"  Processed {i+1}/{total_frames} frames")
+        if frame_count % 250 == 0:
+            print(f"      scanned {frame_count}/{frames_to_run} frames...")
 
     cap.release()
 
-    # Compute biomechanics from tracks
-    print("\nComputing biomechanical metrics...")
-    track_paths = defaultdict(list)
-    for traj in all_trajectories:
-        key = traj["track_id"]
-        track_paths[key].append((
-            traj["frame"],
-            traj["cx"],
-            traj["cy"],
-            traj["area"],
-            traj["circularity"]
-        ))
-    # Use full path (including warm-up frames 1..min_hits-1) when available
-    for tid, full_path in tracker.completed_paths.items():
-        if len(full_path) >= len(track_paths.get(tid, [])):
-            track_paths[tid] = list(full_path)
+    # 3. Filter to moving cells that actually travel along the passage
+    valid_tracks = tracker.finalize_all(min_hits=3, min_net_travel_px=args.min_travel)
 
-    for tid, path in track_paths.items():
-        biomarker = compute_biomarker(path, width_profile, track_id=tid)
-        if biomarker:
-            all_biomarkers.append(biomarker)
+    # If the chosen frame window had no moving cells (because cells pass intermittently at 10,000 fps),
+    # automatically scan forward in coarse steps to find the first active cell passage!
+    if len(valid_tracks) == 0 and args.start_frame == 0 and total_frames > frames_to_run:
+        print("\n      No moving cell passed through the tube in frames 0..{}. Scanning video for active cell passages...".format(frames_to_run))
+        cap_scan = cv2.VideoCapture(video_path)
+        found_frame = None
+        for probe_f in range(0, total_frames, 25):
+            cap_scan.set(cv2.CAP_PROP_POS_FRAMES, probe_f)
+            ok, pf = cap_scan.read()
+            if not ok:
+                break
+            dets = detect_cells_in_passage(pf, background, lumen_mask, roi_y_bounds, diff_thresh=args.diff_thresh)
+            if dets:
+                found_frame = max(0, probe_f - 30)
+                print(f"      -> Found cell inside passage at frame {probe_f}! Tracking window {found_frame}..{found_frame + frames_to_run}...")
+                break
+        cap_scan.release()
 
-    # Save results
-    print(f"\nSaving results ({len(all_biomarkers)} tracks, {len(all_trajectories)} frames)...")
+        if found_frame is not None:
+            args.start_frame = found_frame
+            cap = cv2.VideoCapture(video_path)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, args.start_frame)
+            tracker = PassageCellTracker(slope=slope, max_age=15, min_hits=3, max_step_px=75.0)
+            frame_count = 0
+            for offset in range(frames_to_run):
+                f_idx = args.start_frame + offset
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                frame_count += 1
+                dets = detect_cells_in_passage(
+                    frame, background, lumen_mask, roi_y_bounds, diff_thresh=args.diff_thresh
+                )
+                tracker.step(f_idx, dets)
+            cap.release()
+            valid_tracks = tracker.finalize_all(min_hits=3, min_net_travel_px=args.min_travel)
 
-    # Trajectories CSV
+    # 4. Assemble trajectories & biomechanics
+    all_trajectories = []
+    all_biomarkers = []
+    biomarkers_by_id = {}
+
+    for tid, path in valid_tracks.items():
+        bio = compute_biomarker(tid, path)
+        if bio:
+            all_biomarkers.append(bio)
+            biomarkers_by_id[tid] = bio
+        for p in path:
+            bx, by, bw, bh = p["bbox"]
+            all_trajectories.append({
+                "frame": p["frame"],
+                "track_id": tid,
+                "cx": round(p["cx"], 2),
+                "cy": round(p["cy"], 2),
+                "bbox_x": bx,
+                "bbox_y": by,
+                "bbox_w": bw,
+                "bbox_h": bh,
+                "velocity_px_per_frame": round(p["velocity"], 3),
+                "area": round(p["area"], 2),
+                "circularity": round(p["circularity"], 4),
+                "elongation": round(p["elongation"], 3),
+                "ADI_running": round(p["ADI_running"], 4),
+            })
+
+    # Save CSVs & JSON
     traj_csv = os.path.join(out_dir, "trajectories.csv")
-    with open(traj_csv, "w", newline="") as f:
+    with open(traj_csv, "w", newline="", encoding="utf-8") as f:
         if all_trajectories:
-            writer = csv.DictWriter(f, fieldnames=all_trajectories[0].keys())
+            writer = csv.DictWriter(f, fieldnames=list(all_trajectories[0].keys()))
             writer.writeheader()
             writer.writerows(all_trajectories)
-    print(f"  ✓ {traj_csv}")
 
-    # Biomechanics CSV
     bio_csv = os.path.join(out_dir, "biomechanics.csv")
-    with open(bio_csv, "w", newline="") as f:
+    with open(bio_csv, "w", newline="", encoding="utf-8") as f:
         if all_biomarkers:
-            writer = csv.DictWriter(f, fieldnames=all_biomarkers[0].keys())
+            writer = csv.DictWriter(f, fieldnames=list(all_biomarkers[0].keys()))
             writer.writeheader()
             writer.writerows(all_biomarkers)
-    print(f"  ✓ {bio_csv}")
 
-    # Track summary JSON
     summary = {
         "total_tracks": len(all_biomarkers),
         "total_frames_analyzed": frame_count,
+        "start_frame": args.start_frame,
         "fps": fps,
-        "video": VIDEO,
+        "video": video_path,
         "metrics": {
             "velocity_mean_px_per_frame": float(np.mean([b["velocity_mean"] for b in all_biomarkers])) if all_biomarkers else None,
             "velocity_max_px_per_frame": float(np.max([b["velocity_max"] for b in all_biomarkers])) if all_biomarkers else None,
             "ADI_mean": float(np.mean([b["ADI"] for b in all_biomarkers])) if all_biomarkers else None,
-            "circularity_mean": float(np.mean([b["circularity_mean"] for b in all_biomarkers])) if all_biomarkers else None
+            "circularity_mean": float(np.mean([b["circularity_mean"] for b in all_biomarkers])) if all_biomarkers else None,
         }
     }
-    summary_json = os.path.join(out_dir, "tracking_summary.json" if False else "track_summary.json")
-    with open(summary_json, "w") as f:
+    summary_json = os.path.join(out_dir, "track_summary.json")
+    with open(summary_json, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
-    print(f"  ✓ {summary_json}")
 
-    print("\n" + "=" * 60)
+    # 5. Render Annotated Videos with Bounding Box + Biomechanics HUD
+    print("\n[2/3] Rendering annotated video with bounding boxes & live biomechanics HUD...")
+    full_mp4, active_mp4, best_png, active_frames = render_annotated_videos(
+        video_path=video_path,
+        start_frame=args.start_frame,
+        frames_to_run=frame_count,
+        top_wall=top_wall,
+        bot_wall=bot_wall,
+        valid_tracks=valid_tracks,
+        biomarkers_by_id=biomarkers_by_id,
+        out_dir=out_dir,
+        playback_fps=20.0,
+    )
+
+    print("\n" + "=" * 68)
     print("STAGE 3 COMPLETE")
-    print("=" * 60)
-    print(f"\nResults saved to: {out_dir}")
-    print(f"  - {len(all_biomarkers)} cell tracks")
-    print(f"  - {len(all_trajectories)} frame-wise detections")
+    print("=" * 68)
+    print(f"  ✓ Annotated Full Video    : {full_mp4}")
+    print(f"  ✓ Active Passages Video   : {active_mp4} ({active_frames} active frames)")
+    if os.path.isfile(best_png):
+        print(f"  ✓ Best Tracked Snapshot   : {best_png}")
+    print(f"  ✓ Trajectories CSV        : {traj_csv} ({len(all_trajectories)} rows)")
+    print(f"  ✓ Biomechanics CSV        : {bio_csv} ({len(all_biomarkers)} moving cells)")
+
     if all_biomarkers:
-        print(f"  - Mean velocity : {summary['metrics']['velocity_mean_px_per_frame']:.2f} px/frame")
-        print(f"  - Max velocity  : {summary['metrics']['velocity_max_px_per_frame']:.2f} px/frame")
-        print(f"  - Mean ADI      : {summary['metrics']['ADI_mean']:.3f}")
-        print(f"  - Mean Circ.    : {summary['metrics']['circularity_mean']:.3f}")
-        print("\nTop 10 Longest Cell Tracks:")
-        print(f"  {'ID':>4} | {'Frames':>6} | {'In->Out':>11} | {'VelMean':>7} | {'AreaMean':>8} | {'ADI':>5} | {'CircMean':>8}")
-        print("  " + "-" * 64)
-        top_tracks = sorted(all_biomarkers, key=lambda b: b["track_length_frames"], reverse=True)[:10]
-        for b in top_tracks:
-            span = f"{b['entrance_frame']}->{b['exit_frame']}"
+        print("\nTracked Cells Passing Through Channel:")
+        print(f"  {'CellID':>6} | {'Frames':>6} | {'FrameSpan':>13} | {'X Start->End':>14} | {'VelMean':>7} | {'AreaMean':>8} | {'ADI':>5} | {'Circ':>5}")
+        print("  " + "-" * 80)
+        for b in sorted(all_biomarkers, key=lambda x: x["net_travel_px"], reverse=True)[:15]:
+            fspan = f"{b['entrance_frame']}->{b['exit_frame']}"
+            xspan = f"{b['x_start_px']:.0f}->{b['x_end_px']:.0f}px"
             print(
-                f"  {b['track_id']:4d} | {b['track_length_frames']:6d} | {span:>11} | "
-                f"{b['velocity_mean']:7.2f} | {b['area_mean']:8.1f} | {b['ADI']:5.3f} | {b['circularity_mean']:8.3f}"
+                f"  #{b['track_id']:5d} | {b['track_length_frames']:6d} | {fspan:>13} | {xspan:>14} | "
+                f"{b['velocity_mean']:7.2f} | {b['area_mean']:8.1f} | {b['ADI']:5.2f} | {b['circularity_mean']:5.2f}"
             )
-    print(f"\nNext: Stage 4 (Testing + Deployment)")
+        print(f"\nTo watch the tracked cell video right now, run:\n  start {active_mp4}")
+    else:
+        print("\nNo moving cells exceeded the travel threshold in this window. Try increasing --max-frames 2000 or lowering --diff-thresh 8.")
 
 
 if __name__ == "__main__":

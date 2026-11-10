@@ -56,3 +56,21 @@ Template:
 - **What we changed:** Not fixed yet.
 - **Still wrong:** Those leaks remain on the current overlay.
 - **Evidence:** mid-tube blobs on `overlay.png` / `lumen_mask.png`
+
+## 2026-11-07 — Per-label ROI contour optimization was slower
+
+- **Tried:** Compute each watershed label's bounding box once, then call `findContours` on a cropped label mask.
+- **What went wrong:** The cropped approach took about 0.58 s/frame vs about 0.45 s/frame for the original detector on three seeked frames. An initial centroid-offset mistake also changed detections; it was caught by comparison and not retained.
+- **Why (we think):** The per-pixel coordinate grouping overhead outweighed avoiding repeated full-frame scans for this data.
+- **What we changed:** Replaced it with a single contour extraction over the watershed foreground mask, mapping contours back to labels to preserve the original detection order.
+- **Still wrong:** The new approach is only checked on three frames; full-pipeline runtime and broader output equivalence remain unverified.
+- **Evidence:** Exact detection output comparison against the pre-change `tracking.py` on frames 0, 18637, and 37273; those checks are summarized in `lab/log.md`.
+
+## 2026-11-07 — Stage 3 saves no tracks or trajectory rows
+
+- **Tried:** Inspected Stage 3 output and traced `CellTracker` initialization and result collection.
+- **What went wrong:** `trajectories.csv` and `biomechanics.csv` are zero-byte files; summary reports zero tracks and zero analyzed frames.
+- **Why:** `add_new_tracks` created tracks with `state=None`, while `associate` excludes those tracks from matching. `update` only initialized Kalman state for matched tracks, so new tracks could never reach three hits. The Kalman filter also used invalid property names and vector shapes for the installed OpenCV API. Separately, `main` initialized `frame_count = 0` but never incremented it.
+- **What we changed:** Initialize each track's Kalman filter at creation using OpenCV's `statePost`/`errorCovPost` and column-vector measurement/state shapes; update matched filters through that state; increment the successful decoded-frame count. Also pass the actual track ID into `compute_biomarker` instead of incorrectly using the first frame number as its ID.
+- **Still wrong:** Existing empty Stage 3 output files are not regenerated automatically; rerun Stage 3 to replace them. The full video pipeline has not been rerun.
+- **Evidence:** Before the fix, local `output/stage3/trajectories.csv` and `biomechanics.csv` were 0 bytes and `track_summary.json` reported zero. After the fix, a five-detection synthetic sequence maintained one track for five hits and produced its biomarker with ID 0. On five consecutive real frames, detector counts were 35–39 and the tracker emitted 37 tracks by the third frame.

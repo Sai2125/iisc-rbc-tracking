@@ -65,7 +65,13 @@ Newest entries at the bottom.
 - **Open:** Collaborator needs repo access + local AVI copy.
 - **Next:** Overlay review for the lumen mask.
 
+## 2026-11-07 — Stage 3 detector performance probe
 
-
-
+- **Done:** Optimized watershed contour extraction in `tracking.py` to find cell contours together, then restore label ordering. Kept watershed and measurement rules unchanged.
+- **Evidence:** Compared against the pre-change detector on seeked frames 0, 18637, and 37273 of 37274; detection outputs matched exactly (34, 37, and 35 detections). Detector time was 0.105–0.108 s/frame vs 0.436–0.479 s/frame on these samples.
+- **Open:** This is a three-frame detector-only comparison; full-pipeline runtime was not measured, and the 3-day estimate is not confirmed for this stage.
+- **Next:** If the full run remains slow, profile the actual bottleneck before further changes.
+- **Follow-up timing:** A 500-frame sequential sample from frame 18637 took 64.96 s (0.1299 s/frame) including decode, detection, and tracking. Linear extrapolation to 37274 frames is about 80.7 minutes; postprocessing and CSV output are excluded.
+- **Stage 3 output diagnosis:** The completed output CSVs were empty because `CellTracker` creates `state=None` tracks, but association ignores tracks without a state, so the Kalman initialization path is unreachable. The summary frame counter is also never incremented. See `lab/failures.md`; a code fix and rerun are needed.
+- **Stage 3 tracking fix:** Initialized Kalman state when a detection creates a track, corrected OpenCV matrix property names and column-vector shapes, incremented the successfully decoded frame counter, and passed the true track ID to biomarker calculation. A five-detection synthetic sequence reached five hits; on five consecutive real frames, 37 tracks were emitted by the third frame. Full-video rerun not performed; existing empty output files remain until Stage 3 is rerun.
 

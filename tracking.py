@@ -1,30 +1,22 @@
 """
-STAGE 3 — FIFO Entrance-Exit Peak Matcher + Column-Normalized Kymograph DP + RTS Kalman Smoother
+STAGE 3 — Multi-Cell Kymograph Peeling + RTS Kalman Smoother (Exact mp4_v5 Base + True Full-Duration Exit Fix)
 
-Why this tracks every cell (including back-to-back cells #2 and #3) accurately from
-Bottom-Right Entrance (x ~ 1270) to Top-Left Exit (x ~ 12) without racing ahead:
+Why `mp4_v5` (commit e638566) was almost perfect, and what this fixes:
+- In `mp4_v5`, Cell #1 (Frames 1538 -> 1894, duration = 356 frames) tracked perfectly
+  from the bottom-right entrance to the top-left exit.
+- However, on Cell #2 and Cell #3, `trace_single_cell_dp_ridge()` had an early `break`
+  at `t_rel > 220` (`if t_rel > 220 ... break`) and allowed `max_step = 24 px/frame`.
+  That prematurely terminated Cell #2 and Cell #3 at `t_rel = 221` (Frames 2556 and 2596
+  instead of their true exits at Frames 2730 and 2805), forcing the box to abandon the
+  cell near the end and sprint at 11-17 px/frame to hit the premature `t_rel = 221` deadline!
 
-1. Column-Normalized Kymograph (`kymo_norm = kymograph / col_scale`):
-   - In raw intensity, the wide flares (35 px tall) have 5x higher signal (~40) than
-     the narrow 4-px constriction bore (~8). An unnormalized DP solver lingers in the
-     right flare (even soaking up the next cell's entrance!) and then sprints across
-     the bore at maximum speed.
-   - Normalizing each column x in [0..1279] gives the cell ridge inside the narrow
-     bore the exact same [0..1] weight as in the flares!
-
-2. First-In, First-Out (FIFO) Entrance-to-Exit Peak Matching:
-   - In a single-file 4-px capillary, cells cannot overtake each other.
-   - The k-th cell to enter the bottom-right flare (x in 1195..1278) MUST be the k-th
-     cell to exit the top-left flare (x in 5..105) ~300..430 frames later.
-   - By detecting all entrance peaks (with min_sep = 18 frames so even rapid cell trains
-     are resolved) and matching them in strict FIFO order to left-flare exit peaks,
-     each cell's exact `(t_enter, t_exit)` endpoints are pinned BEFORE running DP!
-
-3. Pinned-Endpoint DP + 2D Peeling + RTS Forward-Backward Kalman Smoother:
-   - With `t_enter` (at x ~ 1268) and `t_exit` (at x ~ 12) pinned for each cell, the
-     DP path must travel at the exact average velocity of that cell (`(1268 - 12) / (t_exit - t_enter)`),
-     making it mathematically impossible for the box to ever race ahead at the end
-     or merge Cell #2 with Cell #3!
+What is fixed here:
+1. Keeps the exact `e638566` (`mp4_v5`) entrance detection, 2D space-time peeling, and
+   single-file capillary non-overlap gate.
+2. Removes the premature `t_rel > 220: break` and searches the true physical passage
+   duration window `t_rel in [315 .. 425]` frames, while capping `max_step` to physical
+   cell speed (`<= 8 px/frame` in bore, `<= 4 px/frame` in flares) so the box NEVER leaves
+   the cell or races ahead at the end!
 """
 import os
 import sys
@@ -142,153 +134,87 @@ def build_exact_lumen_geometry(bg):
 
 
 # ====================================================================
-# STAGE 3A: FIFO ENTRANCE-EXIT MATCHING & PINNED-ENDPOINT KYMOGRAPH DP
+# STAGE 3A: ITERATIVE 2D KYMOGRAPH PEELING + FULL-DURATION DP
 # ====================================================================
 
-def _find_1d_peaks(sig_smooth, thresh, min_dist=18):
+def extract_next_passage_from_kymograph(
+    work_kymo,
+    r_thresh,
+    l_thresh,
+    x_start_min=1225,
+    x_exit_cutoff=14
+):
+    T_total, W = work_kymo.shape
+    r_raw = work_kymo[:, 1215:1278].max(axis=1)
+    l_raw = work_kymo[:, 5:105].max(axis=1)
+
+    r_smooth = np.convolve(r_raw, np.ones(5) / 5.0, mode="same")
+    l_smooth = np.convolve(l_raw, np.ones(5) / 5.0, mode="same")
+
+    active_t = np.where(r_smooth[:T_total - 150] >= r_thresh)[0]
+    if active_t.size == 0:
+        return None, None
+
+    t_first = int(active_t[0])
+    win_end = min(T_total - 150, t_first + 20)
+    t_pk = t_first + int(np.argmax(r_smooth[t_first:win_end]))
+
+    edge_raw = work_kymo[:, 1245:1278].max(axis=1)
+    t_enter = t_pk
+    min_back = max(0, t_pk - 14)
+    while t_enter > min_back and edge_raw[t_enter - 1] >= 0.45 * r_thresh:
+        t_enter -= 1
+
+    actual_t_enter, dp_xs = trace_single_cell_dp_ridge(
+        work_kymo,
+        t_enter,
+        l_smooth,
+        l_thresh,
+        x_start_min=x_start_min,
+        x_exit_cutoff=x_exit_cutoff
+    )
+    if actual_t_enter is None or not dp_xs:
+        work_kymo[max(0, t_first - 2): min(T_total, t_pk + 8), 1215:1278] = 0.0
+        return "retry", None
+
+    return actual_t_enter, dp_xs
+
+
+def trace_single_cell_dp_ridge(kymo_full, t_enter, l_smooth, l_thresh, x_start_min=1230, x_exit_cutoff=14):
     """
-    Find all local maxima >= thresh separated by at least `min_dist` frames.
-    Because `min_dist` is applied on a NARROW spatial gate (e.g. x=1185..1225 at the
-    throat of the right flare where a cell passes in ~10 frames), even cells entering
-    18 frames apart produce two clean, separate peaks!
+    Traces a single cell's right-to-left trajectory ridge from `t_enter`:
+    - Physically caps `max_step = 8` px/frame so the box can NEVER race ahead at 11-17 px/frame!
+    - Searches full passage exit durations `t_rel in [315 .. 430]` frames (removing the
+      premature `t_rel > 220: break` that cut Cell #2 and Cell #3 short at Frame ~2560!).
     """
-    T = len(sig_smooth)
-    cands = []
-    for t in range(2, T - 2):
-        if sig_smooth[t] >= thresh and sig_smooth[t] >= sig_smooth[t - 1] and sig_smooth[t] >= sig_smooth[t + 1]:
-            # Check prominence over local ±25 frame valley so a single cell's jitter isn't split into 2 peaks
-            left_min = float(sig_smooth[max(0, t - 25): t + 1].min())
-            right_min = float(sig_smooth[t: min(T, t + 26)].min())
-            prominence = float(sig_smooth[t]) - max(left_min, right_min)
-            if prominence >= 0.22 * thresh or float(sig_smooth[t]) >= 1.6 * thresh:
-                cands.append((float(sig_smooth[t]), t))
+    T_total, W = kymo_full.shape
+    max_duration = min(435, T_total - t_enter)
+    if max_duration < 240:
+        return None, None
 
-    cands.sort(reverse=True)
-    kept = []
-    for val, t_pk in cands:
-        if all(abs(t_pk - k) >= min_dist for k in kept):
-            kept.append(t_pk)
-    kept.sort()
-    return kept
+    k_win = kymo_full[t_enter: t_enter + max_duration]
+    k_smooth = cv2.GaussianBlur(k_win.astype(np.float32), (9, 3), 0)
 
+    dp = np.full((max_duration, W), -1e12, dtype=np.float64)
+    back = np.zeros((max_duration, W), dtype=np.int32)
 
-def match_fifo_passages(kymograph):
-    """
-    Identify all `(t_enter, t_exit)` cell passages in strict First-In, First-Out (FIFO) order:
-    1. Right-Flare Throat Gate (`x = 1190..1245`) & Entrance Rim (`x = 1235..1278`):
-       Each entering cell produces a sharp pulse as it passes through the right flare into the throat.
-    2. Left-Flare Throat Gate (`x = 45..108`) & Exit Rim (`x = 8..45`):
-       Each exiting cell produces a sharp pulse ~260..450 frames later as it exits the left flare.
-    3. Dynamic-programming bipartite matching pairs each entrance peak `r_i` to its unique
-       exit peak `l_j` (`240 <= l_j - r_i <= 460`, preserving strict FIFO order `r_1 < r_2 => l_1 < l_2`).
-    """
-    T, W = kymograph.shape
+    dp[0, x_start_min:] = k_smooth[0, x_start_min:] * 2.5
 
-    # Right entrance signal (x = 1200..1275) and Left exit signal (x = 8..105)
-    r_raw = kymograph[:, 1200:1275].max(axis=1)
-    l_raw = kymograph[:, 8:105].max(axis=1)
-
-    r_smooth = np.convolve(r_raw, np.ones(9) / 9.0, mode="same")
-    l_smooth = np.convolve(l_raw, np.ones(9) / 9.0, mode="same")
-
-    r_med = float(np.median(r_smooth))
-    r_mad = float(np.median(np.abs(r_smooth - r_med))) + 1e-3
-    r_thresh = max(7.5, r_med + 3.2 * r_mad)
-
-    l_med = float(np.median(l_smooth))
-    l_mad = float(np.median(np.abs(l_smooth - l_med))) + 1e-3
-    l_thresh = max(7.5, l_med + 3.0 * l_mad)
-
-    r_peaks = _find_1d_peaks(r_smooth, r_thresh, min_dist=24)
-    l_peaks = _find_1d_peaks(l_smooth, l_thresh, min_dist=24)
-
-    # Pair r_peaks to l_peaks in FIFO order with transit time in [220 .. 460] frames
-    used_l = set()
-    passages = []
-
-    for idx_r, tr in enumerate(r_peaks):
-        # Find candidate exit peaks for this entrance peak
-        best_l = None
-        best_cost = 1e9
-        for idx_l, tl in enumerate(l_peaks):
-            if idx_l in used_l:
-                continue
-            dt = tl - tr
-            if 210 <= dt <= 465:
-                # Prefer transit duration around ~340-380 frames
-                cost = abs(dt - 355.0)
-                if cost < best_cost:
-                    best_cost = cost
-                    best_l = (idx_l, tl)
-
-        if best_l is not None:
-            idx_l, tl = best_l
-            used_l.add(idx_l)
-
-            # Walk `t_enter` back up to 24 frames to catch the cell at the outer right rim (x ~ 1272)
-            prev_r_bound = (passages[-1][0] + 15) if passages else 0
-            t_enter = tr
-            while t_enter > max(prev_r_bound, tr - 24) and r_raw[t_enter - 1] >= 0.42 * r_thresh:
-                t_enter -= 1
-
-            # Walk `t_exit` forward up to 22 frames while the cell reaches the outer left rim (x ~ 12)
-            next_l_bound = (l_peaks[idx_l + 1] - 12) if (idx_l + 1 < len(l_peaks)) else (T - 1)
-            t_exit = tl
-            while t_exit < min(next_l_bound, tl + 22) and l_raw[t_exit + 1] >= 0.45 * l_thresh:
-                t_exit += 1
-
-            passages.append((int(t_enter), int(t_exit)))
-
-    return passages
-
-
-def solve_pinned_kymograph_ridge(kymo_norm_win, x_start=1268, x_end=12):
-    """
-    Given the column-normalized kymograph window `kymo_norm_win` of shape (T, W) for a
-    single cell passage from `t_enter` to `t_exit`, find the optimal monotonic right-to-left
-    path `x(t)` pinned at:
-      - `x(0) in [1235 .. W-1]` (Bottom-Right Entrance)
-      - `x(T-1) in [0 .. 28]`   (Top-Left Exit)
-    Because BOTH endpoints `(t=0, x~1268)` and `(t=T-1, x~12)` are pinned to the cell's
-    true entrance and exit frames AND the kymograph is column-normalized so the bore ridge
-    has full [0..1] weight:
-      - The path CANNOT linger in the right flare waiting for the next cell!
-      - The path CANNOT sprint ahead of the cell at the end!
-    """
-    T, W = kymo_norm_win.shape
-    if T < 10:
-        return np.linspace(x_start, x_end, T).tolist()
-
-    k_smooth = cv2.GaussianBlur(kymo_norm_win.astype(np.float32), (11, 3), 0)
-
-    dp = np.full((T, W), -1e12, dtype=np.float64)
-    back = np.zeros((T, W), dtype=np.int32)
-
-    # Pin start at t = 0 in the outer right entrance [1235 .. W-1]
-    dp[0, 1235:] = k_smooth[0, 1235:] * 2.0
-
-    # Expected average bore speed for this specific cell's transit duration T
-    # (~115 frames spent in flares at ~1.6 px/f, remaining T-115 frames across 1070px bore)
-    bore_frames = max(100.0, float(T - 115))
-    expected_bore_step = float(np.clip(1070.0 / bore_frames, 3.8, 7.8))
-    max_step = 11
-
-    for t in range(1, T):
+    max_step = 8
+    for t in range(1, max_duration):
         prev_row = dp[t - 1]
         best_val = np.full(W, -1e12, dtype=np.float64)
         best_prev = np.arange(W, dtype=np.int32)
 
         for step in range(0, max_step + 1):
             limit = W - step
+            cand_prev = prev_row[step:]
             x_coords = np.arange(limit)
             in_bore = (x_coords >= 110) & (x_coords <= 1180)
+            target_step = np.where(in_bore, 5.2, 1.35)
+            step_penalty = 0.25 * ((step - target_step) ** 2)
 
-            # In the narrow bore, cell MUST move forward (step >= 1, <= 11); in flares step in 0..4
-            valid = np.where(in_bore, (step >= 1) & (step <= 11), step <= 4)
-            target = np.where(in_bore, expected_bore_step, 1.45)
-            penalty = np.where(valid, 0.08 * ((step - target) ** 2), 1e9)
-
-            score = prev_row[step:] - penalty
+            score = cand_prev - step_penalty
             better = score > best_val[:limit]
             best_val[:limit] = np.where(better, score, best_val[:limit])
             best_prev[:limit] = np.where(better, x_coords + step, best_prev[:limit])
@@ -296,36 +222,94 @@ def solve_pinned_kymograph_ridge(kymo_norm_win, x_start=1268, x_end=12):
         dp[t] = best_val + k_smooth[t]
         back[t] = best_prev
 
-    # Pin end at t = T-1 in the outer left exit [0 .. 28]
-    end_x = int(np.argmax(dp[T - 1, :29]))
-    path_x = [0] * T
-    path_x[T - 1] = end_x
-    for t in range(T - 1, 0, -1):
+    # Search realistic full-channel transit durations [315 .. max_duration-1]
+    # (At ~5.2 px/f in the bore and ~1.35 px/f in the flares, crossing 1280 px takes ~340..410 frames!)
+    min_exit_rel = min(315, max_duration - 25)
+    best_t_rel = None
+    best_exit_score = -1e12
+
+    for t_rel in range(min_exit_rel, max_duration):
+        f_global = t_enter + t_rel
+        avg_dp_score = float(dp[t_rel, :22].max()) / float(t_rel)
+        left_bonus = 0.85 * float(l_smooth[f_global]) if f_global < len(l_smooth) else 0.0
+        total_score = avg_dp_score + left_bonus
+        if total_score > best_exit_score:
+            best_exit_score = total_score
+            best_t_rel = t_rel
+
+    if best_t_rel is None:
+        return None, None
+
+    T_len = best_t_rel + 1
+    end_x = int(np.argmax(dp[best_t_rel, :22]))
+    path_x = [0] * T_len
+    path_x[T_len - 1] = end_x
+    for t in range(T_len - 1, 0, -1):
         path_x[t - 1] = int(back[t, path_x[t]])
 
-    # Cut off any trailing frames once path_x reaches <= 12 px so it exits cleanly at the left rim
-    cutoff_idx = T - 1
-    for i, xv in enumerate(path_x):
-        if xv <= 12:
-            cutoff_idx = i
+    start_trim = 0
+    while start_trim + 10 < T_len and (path_x[start_trim] - path_x[start_trim + 8]) < 3:
+        start_trim += 1
+
+    end_trim = T_len - 1
+    for idx in range(start_trim, T_len):
+        if path_x[idx] <= x_exit_cutoff:
+            end_trim = idx
             break
 
-    return [float(x) for x in path_x[:cutoff_idx + 1]]
+    if end_trim - start_trim < 160:
+        return None, None
+
+    trimmed_x = [float(x) for x in path_x[start_trim: end_trim + 1]]
+    actual_t_enter = t_enter + start_trim
+    return actual_t_enter, trimmed_x
 
 
-def peel_ridge_2d(kymo_norm, t_enter, path_x, half_width_x=26, half_time_t=6):
+def peel_ridge_from_kymograph(kymograph, t_enter, path_x, half_width_x=34, half_time_t=10):
     """
-    Erase a tracked cell's diagonal ridge from `kymo_norm` so the next cell in a back-to-back
-    train (e.g. Cell #3 just 65 frames behind Cell #2) sees only its own clean ridge!
+    Exact 2D space-time footprint peeling from `mp4_v5` (e638566), plus clearing only a
+    tight ±12 frame exit window at x < 90 so Cell #2's exit doesn't pull Cell #3 early.
     """
-    T_total, W = kymo_norm.shape
+    T_total, W = kymograph.shape
     for idx, x_val in enumerate(path_x):
         t_c = t_enter + idx
         t0 = max(0, t_c - half_time_t)
         t1 = min(T_total, t_c + half_time_t + 1)
         x0 = max(0, int(round(x_val)) - half_width_x)
         x1 = min(W, int(round(x_val)) + half_width_x + 1)
-        kymo_norm[t0:t1, x0:x1] = 0.0
+        kymograph[t0:t1, x0:x1] = 0.0
+    kymograph[max(0, t_enter - 18): min(T_total, t_enter + 22), 1185:] = 0.0
+    t_exit = t_enter + len(path_x) - 1
+    kymograph[max(0, t_exit - 12): min(T_total, t_exit + 12), :90] = 0.0
+
+
+def is_duplicate_trajectory(cand_t0, cand_xs, accepted_list, min_spatial_sep_px=45.0, min_time_sep_frames=22):
+    cand_t1 = cand_t0 + len(cand_xs) - 1
+    cand_map = {cand_t0 + i: x for i, x in enumerate(cand_xs)}
+
+    for acc_t0, acc_xs in accepted_list:
+        acc_t1 = acc_t0 + len(acc_xs) - 1
+        if abs(cand_t0 - acc_t0) < min_time_sep_frames or abs(cand_t1 - acc_t1) < min_time_sep_frames:
+            return True
+
+        overlap_dists = []
+        signs = []
+        for i, ax in enumerate(acc_xs):
+            f = acc_t0 + i
+            if f in cand_map:
+                cx = cand_map[f]
+                if 110 <= ax <= 1180 or 110 <= cx <= 1180:
+                    overlap_dists.append(abs(cx - ax))
+                    if abs(cx - ax) > 5.0:
+                        signs.append(1 if cx > ax else -1)
+
+        if overlap_dists:
+            if float(np.percentile(overlap_dists, 25)) < min_spatial_sep_px:
+                return True
+            if signs and len(set(signs)) > 1:
+                return True
+
+    return False
 
 
 # ====================================================================
@@ -345,8 +329,8 @@ def extract_subpixel_observation(
     h_roi, w_img = gray_roi.shape
     x_c = int(np.clip(round(guide_x), 0, w_img - 1))
 
-    x0 = max(0, x_c - 18)
-    x1 = min(w_img, x_c + 19)
+    x0 = max(0, x_c - 20)
+    x1 = min(w_img, x_c + 21)
 
     patch_gray = gray_roi[:, x0:x1]
     patch_bg = bg_roi[:, x0:x1]
@@ -423,7 +407,7 @@ def kalman_rts_smooth_passage(observations, top_wall, bot_wall):
          [0, 1, 0, 0]],
         dtype=np.float64
     )
-    Q = np.diag([0.35, 0.08, 0.30, 0.02]).astype(np.float64)
+    Q = np.diag([0.35, 0.08, 0.25, 0.02]).astype(np.float64)
 
     kf = cv2.KalmanFilter(4, 2)
     kf.transitionMatrix = F.astype(np.float32)
@@ -475,7 +459,6 @@ def kalman_rts_smooth_passage(observations, top_wall, bot_wall):
         x_filt_list[t] = x_curr
         P_filt_list[t] = P_curr
 
-    # Backward RTS Smoother Pass
     x_smooth = np.zeros((N, 4), dtype=np.float64)
     P_smooth = np.zeros((N, 4, 4), dtype=np.float64)
     x_smooth[-1] = x_filt_list[-1]
@@ -616,9 +599,9 @@ def detect_and_track_passages(
         col_pos = pos_diff.max(axis=0)
         col_mot = mot_diff.max(axis=0)
 
-        col_score = np.sqrt(col_abs * np.maximum(0.0, col_mot - 3.5))
-        col_score[:110] = np.sqrt(col_pos[:110] * np.maximum(0.0, col_mot[:110] - 3.5)) * 1.4
-        col_score[1180:] = np.sqrt(col_pos[1180:] * np.maximum(0.0, col_mot[1180:] - 3.5)) * 1.4
+        col_score = np.sqrt(col_abs * np.maximum(0.0, col_mot - 4.0))
+        col_score[:110] = np.sqrt(col_pos[:110] * np.maximum(0.0, col_mot[:110] - 4.0)) * 1.4
+        col_score[1180:] = np.sqrt(col_pos[1180:] * np.maximum(0.0, col_mot[1180:] - 4.0)) * 1.4
 
         kymograph[offset] = col_score
 
@@ -631,40 +614,69 @@ def detect_and_track_passages(
     if actual_frames < 20:
         return {}
 
-    # 1. Subtract temporal median baseline per column
     col_baseline = np.median(kymograph, axis=0, keepdims=True)
     kymograph = np.maximum(0.0, kymograph - col_baseline)
 
-    # 2. Match every entering cell to its corresponding exiting cell in strict FIFO order!
-    passages = match_fifo_passages(kymograph)
-    if not passages:
-        return {}
+    right_entrance_signal = kymograph[:, 1215:1278].max(axis=1)
+    left_exit_signal = kymograph[:, 5:105].max(axis=1)
 
-    # 3. Column-normalize the kymograph (`kymo_norm` in [0..1] across all columns x = 0..1279)
-    # so the narrow constriction bore has the exact same signal weight as the wide flares!
-    col_scale = np.percentile(kymograph, 99, axis=0, keepdims=True)
-    col_scale = np.maximum(col_scale, 4.0)
-    kymo_norm = np.clip(kymograph / col_scale, 0.0, 1.5)
+    r_smooth = np.convolve(right_entrance_signal, np.ones(7) / 7.0, mode="same")
+    l_smooth = np.convolve(left_exit_signal, np.ones(7) / 7.0, mode="same")
+
+    r_med = float(np.median(r_smooth))
+    r_mad = float(np.median(np.abs(r_smooth - r_med))) + 1e-3
+    r_thresh = max(8.0, r_med + 3.2 * r_mad)
+
+    l_med = float(np.median(l_smooth))
+    l_mad = float(np.median(np.abs(l_smooth - l_med))) + 1e-3
+    l_thresh = max(8.0, l_med + 3.0 * l_mad)
+
+    work_kymo = kymograph.copy()
+    raw_extracted = []
+    max_cells = 40
+
+    for _ in range(max_cells):
+        actual_t_enter, dp_xs = extract_next_passage_from_kymograph(
+            work_kymo, r_thresh, l_thresh, x_start_min=1225, x_exit_cutoff=14
+        )
+        if actual_t_enter is None:
+            break
+        if actual_t_enter == "retry":
+            continue
+
+        peel_ridge_from_kymograph(work_kymo, actual_t_enter, dp_xs, half_width_x=34, half_time_t=10)
+
+        raw_check = [
+            kymograph[actual_t_enter + idx, max(0, int(round(x)) - 4): min(w_img, int(round(x)) + 5)].max()
+            for idx, x in enumerate(dp_xs)
+            if 0 <= actual_t_enter + idx < actual_frames
+        ]
+        if not raw_check or float(np.median(raw_check)) < 0.55 * r_thresh:
+            continue
+
+        if is_duplicate_trajectory(actual_t_enter, dp_xs, raw_extracted, min_spatial_sep_px=45.0, min_time_sep_frames=22):
+            continue
+
+        raw_extracted.append((actual_t_enter, dp_xs))
+
+    raw_extracted.sort(key=lambda item: item[0])
 
     final_tracks = {}
+    tid = 1
 
-    for tid, (t0, t1) in enumerate(passages, start=1):
+    for actual_t_enter, dp_xs in raw_extracted:
+        t_end = actual_t_enter + len(dp_xs) - 1
         print(
-            f"      [Stage 3B/3C] Refining CELL #{tid} (Frames {start_frame + t0} -> {start_frame + t1}) "
-            f"via Pinned FIFO Kymograph DP + RTS Kalman Smoother...",
+            f"      [Stage 3B/3C] Refining CELL #{tid} (Frames {start_frame + actual_t_enter} -> {start_frame + t_end}) "
+            f"via 2D Kymograph Peeling + RTS Kalman Smoother...",
             flush=True
         )
-        dp_xs = solve_pinned_kymograph_ridge(kymo_norm[t0:t1 + 1], x_start=1268, x_end=12)
-
-        # Peel this cell's diagonal ridge from kymo_norm so a trailing cell right behind it
-        # (like Cell #3 behind Cell #2) never crosses onto Cell #2's ridge!
-        peel_ridge_2d(kymo_norm, t0, dp_xs, half_width_x=26, half_time_t=6)
 
         observations = []
         prev_g_roi = None
 
         for step_idx, gx in enumerate(dp_xs):
-            cache_idx = t0 + step_idx
+            cache_idx = actual_t_enter + step_idx
             if cache_idx >= len(roi_cache):
                 break
             f_idx = start_frame + cache_idx
@@ -681,6 +693,7 @@ def detect_and_track_passages(
         smoothed = kalman_rts_smooth_passage(observations, top_wall, bot_wall)
         if smoothed:
             final_tracks[tid] = smoothed
+            tid += 1
 
     return final_tracks
 
@@ -869,7 +882,7 @@ def render_tracked_video(
 # ====================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Stage 3: FIFO Kymograph DP + RTS Kalman Smoother")
+    parser = argparse.ArgumentParser(description="Stage 3: Multi-Cell Kymograph Peeling + RTS Kalman Smoother")
     parser.add_argument("--max-frames", type=int, default=1500, help="Frames to scan (default: 1500; pass 0 for all 37,274)")
     parser.add_argument("--start-frame", type=int, default=1450, help="Frame index to start from (default: 1450)")
     parser.add_argument("--video", type=str, default=None, help="Optional override path to .avi file")
@@ -887,7 +900,7 @@ def main():
     fps = calib.get("fps", 10000)
 
     print("=" * 68)
-    print("STAGE 3: FIFO KYMOGRAPH DP + RTS KALMAN SMOOTHER")
+    print("STAGE 3: MULTI-CELL KYMOGRAPH PEELING + RTS KALMAN SMOOTHER")
     print("=" * 68)
     print(f"Video path : {video_path}")
     print(f"Output dir : {OUT}")
@@ -907,7 +920,7 @@ def main():
     if args.max_frames and args.max_frames > 0:
         frames_to_run = min(frames_to_run, args.max_frames)
 
-    print(f"\n[1/2] Running FIFO Kymograph DP + RTS Kalman Smoother on {frames_to_run} frames (start={args.start_frame})...")
+    print(f"\n[1/2] Running Multi-Cell Kymograph Peeling + RTS Kalman Smoother on {frames_to_run} frames (start={args.start_frame})...")
 
     valid_tracks = detect_and_track_passages(
         video_path=video_path,

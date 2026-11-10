@@ -138,37 +138,59 @@ def build_exact_lumen_geometry(bg):
 # STAGE 3A: SUCCESSIVE KYMOGRAPH DP WITH IMMEDIATE EXIT CUTOFF
 # ====================================================================
 
-def find_all_entrance_peaks(r_smooth, r_raw, r_thresh, min_distance=48):
+def extract_next_passage_from_kymograph(
+    work_kymo,
+    r_thresh,
+    l_thresh,
+    x_start_min=1225,
+    x_exit_cutoff=14
+):
     """
-    Find every distinct cell entrance peak in the bottom-right flare, even when two
-    cells enter only ~55-75 frames apart (like Cell #2 at Frame 2374 and Cell #3 at Frame 2434).
+    Iterative 2D Kymograph Ridge Extractor:
+    Recomputes the entrance and exit signals directly from the CURRENT `work_kymo`
+    (after previous cells' ±16 px 2D ridges have been peeled out!).
+    Because peeling happens in 2D (t, x) with a tight ±16 px cell radius rather than
+    blocking out a 48-frame time window, even two cells entering 8-12 frames apart
+    (simultaneously inside the right flare!) are resolved one after another!
     """
-    T = len(r_smooth)
-    candidates = []
-    for t in range(2, T - 2):
-        if r_smooth[t] >= r_thresh and r_smooth[t] >= r_smooth[t - 1] and r_smooth[t] >= r_smooth[t + 1]:
-            candidates.append((float(r_smooth[t]), t))
+    T_total, W = work_kymo.shape
+    r_raw = work_kymo[:, 1215:1278].max(axis=1)
+    l_raw = work_kymo[:, 5:105].max(axis=1)
 
-    # Greedy non-maximum suppression by peak height with min_distance=48 frames
-    candidates.sort(reverse=True)
-    selected_peaks = []
-    for val, t_pk in candidates:
-        if all(abs(t_pk - existing) >= min_distance for existing in selected_peaks):
-            selected_peaks.append(t_pk)
-    selected_peaks.sort()
+    r_smooth = np.convolve(r_raw, np.ones(5) / 5.0, mode="same")
+    l_smooth = np.convolve(l_raw, np.ones(5) / 5.0, mode="same")
 
-    # For each entrance peak, walk back at most 28 frames to find the exact entrance frame at x ~ 1272
-    entrances = []
-    for i, t_pk in enumerate(selected_peaks):
-        t_enter = t_pk
-        # Do not walk back into a previous cell's entrance
-        prev_limit = selected_peaks[i - 1] + 25 if i > 0 else 0
-        min_back = max(prev_limit, t_pk - 28)
-        while t_enter > min_back and r_raw[t_enter - 1] >= 0.45 * r_thresh:
-            t_enter -= 1
-        entrances.append((t_enter, t_pk))
+    # Find the earliest frame `t` where an unpeeled cell enters the right flare
+    active_t = np.where(r_smooth[:T_total - 150] >= r_thresh)[0]
+    if active_t.size == 0:
+        return None, None
 
-    return entrances
+    t_first = int(active_t[0])
+    # Find the first local peak within 20 frames of t_first (tight window so a second cell 12 frames later isn't swallowed)
+    win_end = min(T_total - 150, t_first + 20)
+    t_pk = t_first + int(np.argmax(r_smooth[t_first:win_end]))
+
+    # Walk back at most 14 frames while signal is active at the extreme entrance edge (x = 1245..1278)
+    edge_raw = work_kymo[:, 1245:1278].max(axis=1)
+    t_enter = t_pk
+    min_back = max(0, t_pk - 14)
+    while t_enter > min_back and edge_raw[t_enter - 1] >= 0.45 * r_thresh:
+        t_enter -= 1
+
+    actual_t_enter, dp_xs = trace_single_cell_dp_ridge(
+        work_kymo,
+        t_enter,
+        l_smooth,
+        l_thresh,
+        x_start_min=x_start_min,
+        x_exit_cutoff=x_exit_cutoff
+    )
+    if actual_t_enter is None or not dp_xs:
+        # Zero out the failed local entrance blip (only 8 frames in right flare) so the loop advances
+        work_kymo[max(0, t_first - 2): min(T_total, t_pk + 8), 1215:1278] = 0.0
+        return "retry", None
+
+    return actual_t_enter, dp_xs
 
 
 def trace_single_cell_dp_ridge(kymo_full, t_enter, l_smooth, l_thresh, x_start_min=1230, x_exit_cutoff=14):
@@ -271,10 +293,16 @@ def trace_single_cell_dp_ridge(kymo_full, t_enter, l_smooth, l_thresh, x_start_m
     return actual_t_enter, trimmed_x
 
 
-def peel_ridge_from_kymograph(kymograph, t_enter, path_x, half_width_x=38):
+def peel_ridge_from_kymograph(kymograph, t_enter, path_x, half_width_x=16):
     """
-    Erase (zero out) a tracked cell's space-time ridge from the kymograph so a second
-    cell right behind it (like Cell #3 behind Cell #2) is tracked cleanly without interference.
+    Erase (zero out) ONLY a tight ±16 px spatial band around a tracked cell's 2D
+    space-time ridge `(t, path_x[t])` from the kymograph!
+    Why ±16 px?
+      - A single RBC is ~14-18 px long.
+      - If a second cell enters only 8-15 frames (~20-35 px) behind the first cell,
+        at frame `t` the first cell is at `x_1(t)` while the second cell is at
+        `x_2(t) = x_1(t) + 28 px`!
+      - Peeling ±16 px removes Cell #1 completely while leaving Cell #2's ridge untouched!
     """
     T_total, W = kymograph.shape
     for idx, x_val in enumerate(path_x):
@@ -283,6 +311,8 @@ def peel_ridge_from_kymograph(kymograph, t_enter, path_x, half_width_x=38):
             x0 = max(0, int(round(x_val)) - half_width_x)
             x1 = min(W, int(round(x_val)) + half_width_x + 1)
             kymograph[t, x0:x1] = 0.0
+    # Also clear a tiny 6-frame window at the entrance edge around t_enter so the exact same cell doesn't re-trigger
+    kymograph[max(0, t_enter - 3): min(T_total, t_enter + 5), max(1215, int(round(path_x[0])) - 18):] = 0.0
 
 
 # ====================================================================
@@ -610,28 +640,42 @@ def detect_and_track_passages(
     l_mad = float(np.median(np.abs(l_smooth - l_med))) + 1e-3
     l_thresh = max(8.0, l_med + 3.0 * l_mad)
 
-    # Detect ALL distinct entrance peaks (including back-to-back cells ~55 frames apart!)
-    entrances = find_all_entrance_peaks(r_smooth, right_entrance_signal, r_thresh, min_distance=48)
-
+    # Iteratively extract and peel 2D cell ridges from `work_kymo` (no fixed min_distance cap!
+    # Even cells entering 8-12 frames apart are separated because peeling only removes ±16 px
+    # along the first cell's 2D (t, x) diagonal, leaving the trailing cell's parallel ridge intact!)
     work_kymo = kymograph.copy()
+    raw_extracted = []
+    max_cells = 80
+
+    for _ in range(max_cells):
+        actual_t_enter, dp_xs = extract_next_passage_from_kymograph(
+            work_kymo, r_thresh, l_thresh, x_start_min=1225, x_exit_cutoff=14
+        )
+        if actual_t_enter is None:
+            break
+        if actual_t_enter == "retry":
+            continue
+
+        peel_ridge_from_kymograph(work_kymo, actual_t_enter, dp_xs, half_width_x=16)
+
+        # Verify that this ridge has genuine independent signal energy (not a faint ghost echo of an already-peeled cell)
+        raw_Check = [kymograph[actual_t_enter + idx, int(round(x))] for idx, x in enumerate(dp_xs) if 0 <= actual_t_enter + idx < actual_frames]
+        if float(np.percentile(raw_Check, 75)) < 0.55 * r_thresh:
+            continue
+
+        raw_extracted.append((actual_t_enter, dp_xs))
+
+    # Sort extracted passages chronologically by entrance frame
+    raw_extracted.sort(key=lambda item: item[0])
+
     final_tracks = {}
     tid = 1
 
-    for t_enter_cand, _ in entrances:
-        actual_t_enter, dp_xs = trace_single_cell_dp_ridge(
-            work_kymo, t_enter_cand, l_smooth, l_thresh, x_start_min=1225, x_exit_cutoff=14
-        )
-        if actual_t_enter is None or not dp_xs:
-            continue
-
-        # Peel this cell's ridge out of work_kymo so a trailing cell right behind it (Cell #3)
-        # tracks its own ridge cleanly!
-        peel_ridge_from_kymograph(work_kymo, actual_t_enter, dp_xs, half_width_x=38)
-
+    for actual_t_enter, dp_xs in raw_extracted:
         t_end = actual_t_enter + len(dp_xs) - 1
         print(
             f"      [Stage 3B/3C] Refining CELL #{tid} (Frames {start_frame + actual_t_enter} -> {start_frame + t_end}) "
-            f"via Kymograph Peeling + RTS Kalman Smoother...",
+            f"via 2D Kymograph Peeling + RTS Kalman Smoother...",
             flush=True
         )
 

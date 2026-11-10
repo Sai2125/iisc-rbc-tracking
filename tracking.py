@@ -132,19 +132,34 @@ def detect_cells(frame, background, width_profile_dict, verbose=False):
     thresh_color = cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
     cv2.watershed(thresh_color, markers)
 
-    # Extract cell contours in a single pass over the foreground mask
-    # (Watershed boundary pixels have markers == -1 and background is <= 0,
-    # so positive label islands are 8-disconnected and can be extracted together,
-    # then sorted by label to preserve exact detection ordering.)
-    fg_mask = (markers > 0).astype(np.uint8)
+    # Extract cell contours in a single pass over the foreground mask.
+    # Note: connectedComponents(sure_fg) + 1 assigns label 1 to the outer background
+    # and labels >= 2 to the foreground cell markers (with -1 as watershed dams).
+    # Therefore, cell foreground is strictly (markers > 1), NOT (markers > 0)!
+    fg_mask = (markers > 1).astype(np.uint8)
     cnts, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     label_to_cnt = {}
     for cnt in cnts:
-        x0, y0 = cnt[0, 0]
-        lbl = int(markers[y0, x0])
-        if lbl > 0 and lbl not in label_to_cnt:
-            label_to_cnt[lbl] = cnt
+        x, y, w, h = cv2.boundingRect(cnt)
+        roi_markers = markers[y:y+h, x:x+w]
+        labels_in_roi = [int(l) for l in np.unique(roi_markers) if l > 1]
+        if len(labels_in_roi) == 1:
+            lbl = labels_in_roi[0]
+            if lbl not in label_to_cnt:
+                label_to_cnt[lbl] = cnt
+        else:
+            # If two watershed labels touch diagonally (8-connected), extract each within its small ROI box
+            for lbl in labels_in_roi:
+                if lbl in label_to_cnt:
+                    continue
+                sub_mask = (roi_markers == lbl).astype(np.uint8)
+                sub_cnts, _ = cv2.findContours(sub_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if sub_cnts:
+                    c = sub_cnts[0].copy()
+                    c[:, 0, 0] += x
+                    c[:, 0, 1] += y
+                    label_to_cnt[lbl] = c
 
     cell_data = []
     for label in sorted(label_to_cnt.keys()):
@@ -275,7 +290,7 @@ class CellTracker:
 
         for i, tid in enumerate(valid_tracks):
             track = self.tracks[tid]
-            pred_pos = track["state"].statePost[:2].reshape(-1)
+            pred_pos = track["state"].statePre[:2].reshape(-1)
             for j, (cx, cy, area, circ) in enumerate(detections):
                 dist = (cx - float(pred_pos[0]))**2 + (cy - float(pred_pos[1]))**2
                 cost_matrix[i, j] = dist

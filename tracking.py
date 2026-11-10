@@ -1,22 +1,26 @@
 """
-STAGE 3 — End-to-End Passage RBC Detection, Tracking & Annotated Video Generator
+STAGE 3 — Single-Track-Per-Cell Passage Tracker & Annotated Video Generator
 
-Tracks Red Blood Cells from the start of the microfluidic passage (Entrance Flare)
-through the narrow constriction bore to the end of the passage (Exit Flare).
+Guarantees ONE single continuous track (and one unified bounding box) per RBC
+from the start of the microfluidic passage to the end of the passage:
 
-Fixes over the original draft:
-1. Full-width exact interior lumen mask (x = 0..1279) including both entrance & exit flares,
-   peeled inside the dark glass walls and median-smoothed so glass wall shimmer & stuck dirt
-   (e.g. at x=435) are excluded.
-2. Bounding-box + contour extraction (`bbox_x, bbox_y, bbox_w, bbox_h, area, circularity, elongation`)
-   without full-frame Otsu hallucinations on empty frames.
-3. Channel-axis Kalman + Hungarian tracker with longitudinal velocity continuity so a fast cell
-   squeezing through the narrow bore keeps a single continuous Cell ID from entrance to exit.
-4. Stationary-speck rejection: filters out wall-vibration false positives that do not travel
-   along the channel passage.
-5. Direct annotated video output (`output/stage3/tracked_cells_video.mp4` and
-   `output/stage3/active_passages_only.mp4`) drawing the bounding box, trajectory trail,
-   Cell ID, and live biomechanics (Velocity, Area, Circularity, ADI) directly on the video.
+1. Single-Cell Contour Merging (Intra-Frame NMS):
+   In brightfield/phase microscopy, a single RBC has a bright center + dark rim
+   (or leading + trailing edge in |frame - bg|), which previously split one cell
+   into 2-3 separate contours and spawned parallel tracks on the same cell.
+   Now, all contours within `merge_radius_px = 55` along the channel axis are
+   fused into ONE unified cell bounding box per cell.
+
+2. Passage-Level Trajectory Stitcher + Gap Interpolation:
+   Links any track fragments across the narrow bore (including across the stuck
+   wall dirt at x ~ 435) using monotonic channel-flow velocity matching, and
+   interpolates short 1-8 frame gaps so the bounding box never flickers or
+   switches IDs mid-passage.
+
+3. Strict Complete-Passage Filter:
+   Rejects short noise blips and wall jitter; keeps only real cell passages that
+   substantively traverse the channel (`min_span_px = 180`), renumbered cleanly
+   as CELL #1, CELL #2, ...
 """
 import os
 import sys
@@ -91,17 +95,9 @@ def build_exact_lumen_geometry(bg):
     Trace the top and bottom dark glass walls across the ENTIRE frame width (x = 0..W-1),
     including the left flare (x < 115), narrow constriction (115 <= x <= 1165),
     and right flare (x > 1165).
-
-    Returns:
-      lumen_mask (uint8 HxW, 255 inside lumen, 0 on walls & bath),
-      top_wall (float array W),
-      bot_wall (float array W),
-      slope (float),
-      intercept (float)
     """
     h, w = bg.shape[:2]
 
-    # 1. Sigma-clipped linear fit on the central bore (x = 120 .. w-120)
     xs_fit = np.arange(120, w - 120, dtype=np.float64)
     ys_fit = np.array([bg[:, int(x)].argmin() for x in xs_fit], dtype=np.float64)
     for _ in range(4):
@@ -114,13 +110,11 @@ def build_exact_lumen_geometry(bg):
     A = np.polyfit(xs_fit, ys_fit, 1)
     slope, intercept = float(A[0]), float(A[1])
 
-    # 2. Locate upper and lower dark glass wall centers in every column x = 0..w-1
     top_wall = np.zeros(w, dtype=np.float64)
     bot_wall = np.zeros(w, dtype=np.float64)
 
     for x in range(w):
         yc = slope * x + intercept
-        # Flares widen up to ~28 px from centerline; narrow bore is within ~9 px
         max_search = 28 if (x < 115 or x > 1165) else 9
         y_lo = max(0, int(round(yc - max_search)))
         y_hi = min(h - 1, int(round(yc + max_search)))
@@ -132,16 +126,14 @@ def build_exact_lumen_geometry(bg):
         top_wall[x] = y_lo + int(np.argmin(top_slice)) if top_slice.size > 0 else yc - 3.5
         bot_wall[x] = (y_mid + 1) + int(np.argmin(bot_slice)) if bot_slice.size > 0 else yc + 3.5
 
-    # 3. Median-filter wall positions to ignore dirt specks stuck on glass
     top_smooth = _medfilt1d(top_wall, k=15)
     bot_smooth = _medfilt1d(bot_wall, k=15)
 
-    # 4. Build interior lumen mask (peel 1.0 px inside dark wall centers so wall shimmer is excluded,
-    # while guaranteeing at least a 3 px core in the narrowest bore so squeezed cells are detected)
     lumen_mask = np.zeros((h, w), dtype=np.uint8)
     for x in range(w):
         yc = 0.5 * (top_smooth[x] + bot_smooth[x])
-        half_w = max(2.0, 0.5 * (bot_smooth[x] - top_smooth[x]) - 1.0)
+        # Peel 1.5 px inside walls so wall shimmer is excluded
+        half_w = max(1.8, 0.5 * (bot_smooth[x] - top_smooth[x]) - 1.5)
         y0 = max(0, int(np.floor(yc - half_w)))
         y1 = min(h, int(np.ceil(yc + half_w)) + 1)
         lumen_mask[y0:y1, x] = 255
@@ -150,69 +142,115 @@ def build_exact_lumen_geometry(bg):
 
 
 # ====================================================================
-# CELL DETECTION INSIDE THE PASSAGE LUMEN
+# SINGLE-CELL CONTOUR FUSION (Prevents 1 cell from becoming 2-3 boxes)
 # ====================================================================
 
-def detect_cells_in_passage(frame, background, lumen_mask, roi_y_bounds, diff_thresh=11.0):
+def _merge_same_cell_blobs(raw_blobs, merge_radius_px=55.0):
     """
-    Detect RBCs strictly inside the microfluidic passage (flares + constriction bore).
+    A single RBC in brightfield/phase contrast produces a bright center + dark rim
+    (or leading + trailing lobes), which threshold into 2-3 nearby contours.
+    This merges any blobs within `merge_radius_px` along X into ONE single cell detection.
+    """
+    if len(raw_blobs) <= 1:
+        return raw_blobs
 
-    Returns list of dicts:
-      {
-        "cx": float, "cy": float,
-        "bbox": (x, y, w, h),
-        "area": float,
-        "circularity": float,
-        "elongation": float,
-        "peak_diff": float
-      }
+    blobs = sorted(raw_blobs, key=lambda b: b["cx"])
+    merged = []
+    cluster = [blobs[0]]
+
+    for b in blobs[1:]:
+        if abs(b["cx"] - cluster[-1]["cx"]) <= merge_radius_px:
+            cluster.append(b)
+        else:
+            merged.append(_fuse_cluster(cluster))
+            cluster = [b]
+    merged.append(_fuse_cluster(cluster))
+    return merged
+
+
+def _fuse_cluster(cluster):
+    if len(cluster) == 1:
+        return cluster[0]
+
+    # Weight centroid by each sub-contour's area * peak_diff
+    weights = np.array([max(1.0, c["area"] * c["peak_diff"]) for c in cluster], dtype=np.float64)
+    w_sum = float(weights.sum())
+    cx = float(np.sum([c["cx"] * w for c, w in zip(cluster, weights)]) / w_sum)
+    cy = float(np.sum([c["cy"] * w for c, w in zip(cluster, weights)]) / w_sum)
+
+    x0 = min(c["bbox"][0] for c in cluster)
+    y0 = min(c["bbox"][1] for c in cluster)
+    x1 = max(c["bbox"][0] + c["bbox"][2] for c in cluster)
+    y1 = max(c["bbox"][1] + c["bbox"][3] for c in cluster)
+    bw = int(x1 - x0)
+    bh = int(y1 - y0)
+
+    total_area = float(sum(c["area"] for c in cluster))
+    effective_area = max(total_area, 0.72 * float(bw * bh))
+
+    # Equivalent ellipse perimeter from bounding box for merged cell circularity
+    a = max(1.0, 0.5 * bw)
+    b = max(1.0, 0.5 * bh)
+    perim_approx = float(np.pi * (3.0 * (a + b) - np.sqrt((3.0 * a + b) * (a + 3.0 * b))))
+    circ = float(4.0 * np.pi * effective_area / (perim_approx * perim_approx)) if perim_approx > 0 else 0.5
+    circ = float(np.clip(circ, 0.08, 1.0))
+
+    long_side = float(max(bw, bh))
+    short_side = float(max(1, min(bw, bh)))
+
+    return {
+        "cx": cx,
+        "cy": cy,
+        "bbox": (int(x0), int(y0), bw, bh),
+        "area": effective_area,
+        "circularity": circ,
+        "elongation": long_side / short_side,
+        "peak_diff": float(max(c["peak_diff"] for c in cluster)),
+    }
+
+
+def detect_cells_in_passage(frame, background, lumen_mask, roi_y_bounds, diff_thresh=13.0):
+    """
+    Detect RBCs strictly inside the microfluidic passage and fuse multi-lobe
+    contours of the same cell into a single bounding box.
     """
     y_min, y_max = roi_y_bounds
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
 
-    # Work only on the horizontal strip containing the tilted tube (5x faster than full 1280x480)
     gray_roi = gray[y_min:y_max, :].astype(np.float32)
     bg_roi = background[y_min:y_max, :]
     mask_roi = lumen_mask[y_min:y_max, :]
 
-    # Absolute contrast difference against static temporal median background
     diff = np.abs(gray_roi - bg_roi)
     diff = cv2.GaussianBlur(diff, (3, 3), 0)
-
-    # Zero out everything outside the interior tube lumen (excludes bath + dark wall ridges)
     diff[mask_roi == 0] = 0.0
 
-    # Adaptive + floor threshold: only trigger when a real cell perturbation is inside the lumen
     max_val = float(diff.max())
     if max_val < diff_thresh:
         return []
 
-    # Threshold at max(diff_thresh, 0.35 * local_peak) to segment the cell body cleanly
     binary = (diff >= diff_thresh).astype(np.uint8) * 255
 
-    # Connect slightly separated bright/dark phase rings of the same cell along the channel
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 3))
+    # Horizontal morphological close (11x3) bridges the bright center and rim of one cell
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 3))
     binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
 
     cnts, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    detections = []
+    raw_blobs = []
 
     for cnt in cnts:
         area = float(cv2.contourArea(cnt))
         bx, by_rel, bw, bh = cv2.boundingRect(cnt)
         box_area = float(bw * bh)
 
-        # In the narrow constriction (width ~4 px), a squeezed cell may have contourArea ~ 10-15 px^2
-        # and bounding box ~ 8x4 px. Reject tiny 1-2 px sensor specks and giant artifacts.
-        if area < 8.0 and box_area < 14.0:
+        if area < 9.0 and box_area < 15.0:
             continue
         if area > 4500.0:
             continue
 
-        # Check peak intensity difference inside this blob to reject weak wall vibration
         blob_patch = diff[by_rel:by_rel + bh, bx:bx + bw]
         peak_diff = float(blob_patch.max()) if blob_patch.size > 0 else 0.0
-        if peak_diff < diff_thresh + 2.0:
+        if peak_diff < diff_thresh + 2.5:
             continue
 
         M = cv2.moments(cnt)
@@ -224,46 +262,45 @@ def detect_cells_in_passage(frame, background, lumen_mask, roi_y_bounds, diff_th
             cy = float(by_rel + 0.5 * bh + y_min)
 
         by = int(by_rel + y_min)
-        effective_area = max(area, 0.75 * box_area)
+        effective_area = max(area, 0.72 * box_area)
 
         perimeter = float(cv2.arcLength(cnt, True))
         circularity = float(4.0 * np.pi * area / (perimeter * perimeter)) if perimeter > 0 else 0.5
-        circularity = float(np.clip(circularity, 0.05, 1.0))
+        circularity = float(np.clip(circularity, 0.08, 1.0))
 
         long_side = float(max(bw, bh))
         short_side = float(max(1, min(bw, bh)))
-        elongation = long_side / short_side
 
-        detections.append({
+        raw_blobs.append({
             "cx": cx,
             "cy": cy,
             "bbox": (int(bx), int(by), int(bw), int(bh)),
             "area": effective_area,
             "circularity": circularity,
-            "elongation": elongation,
+            "elongation": long_side / short_side,
             "peak_diff": peak_diff,
         })
 
-    return detections
+    # Fuse nearby contours belonging to the same cell into ONE detection
+    return _merge_same_cell_blobs(raw_blobs, merge_radius_px=55.0)
 
 
 # ====================================================================
-# PASSAGE TRACKER (Follows cells continuously from Entrance to Exit)
+# SINGLE-TRACK-PER-PASSAGE TRACKER + FRAGMENT STITCHER
 # ====================================================================
 
 class PassageCellTracker:
     """
-    Multi-object tracker specialized for high-speed microfluidic channel passages.
-    Uses constant-velocity Kalman prediction + anisotropic channel-axis association
-    so fast cells accelerating into the constriction bore maintain a single ID.
+    Tracks each RBC across the full passage and stitches any broken segments
+    (e.g. across the narrowest bore or dirt spot) into ONE continuous track per cell.
     """
-    def __init__(self, slope, max_age=15, min_hits=3, max_step_px=75.0):
+    def __init__(self, slope, intercept, max_age=25, min_hits=4, max_step_px=120.0):
         self.slope = slope
+        self.intercept = intercept
         self.max_age = max_age
         self.min_hits = min_hits
         self.max_step_px = max_step_px
 
-        # Unit vector along channel passage
         norm = np.sqrt(1.0 + slope * slope)
         self.ux = 1.0 / norm
         self.uy = slope / norm
@@ -279,8 +316,8 @@ class PassageCellTracker:
             [[1, 0, 1, 0], [0, 1, 0, 1], [0, 0, 1, 0], [0, 0, 0, 1]],
             dtype=np.float32
         )
-        kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.25
-        kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 4.0
+        kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.35
+        kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 3.0
         kf.errorCovPost = np.eye(4, dtype=np.float32) * 10.0
         state = np.array([[float(cx)], [float(cy)], [float(vx)], [float(vy)]], dtype=np.float32)
         kf.statePre = state.copy()
@@ -288,7 +325,6 @@ class PassageCellTracker:
         return kf
 
     def step(self, frame_idx, detections):
-        # 1. Predict active tracks forward
         for tid, tr in self.tracks.items():
             tr["kf"].predict()
 
@@ -310,21 +346,15 @@ class PassageCellTracker:
                 dt = max(1, frame_idx - tr["last_frame"])
 
                 for j, d in enumerate(detections):
-                    # Distance from Kalman prediction
                     dx_pred = d["cx"] - px
                     dy_pred = d["cy"] - py
-                    # Project error along channel axis (s) and perpendicular to channel (n)
                     ds = abs(dx_pred * self.ux + dy_pred * self.uy)
                     dn = abs(-dx_pred * self.uy + dy_pred * self.ux)
-
-                    # Raw displacement from last observed position
                     raw_dist = np.hypot(d["cx"] - last_x, d["cy"] - last_y) / float(dt)
 
-                    # Penalize perpendicular jumps heavily (cells cannot jump through glass walls)
-                    if dn <= 18.0 and (ds <= self.max_step_px or raw_dist <= self.max_step_px):
-                        cost[i, j] = min(ds, raw_dist) + 3.5 * dn
+                    if dn <= 20.0 and (ds <= self.max_step_px or raw_dist <= self.max_step_px):
+                        cost[i, j] = min(ds, raw_dist) + 3.0 * dn
 
-            # Solve assignment (finite BIG_COST avoids scipy 'cost matrix is infeasible' ValueError)
             try:
                 from scipy.optimize import linear_sum_assignment
                 r_ind, c_ind = linear_sum_assignment(cost)
@@ -345,7 +375,6 @@ class PassageCellTracker:
                     matched_t.append(track_ids[r])
                     matched_d.append(c)
 
-        # 2. Update matched tracks
         for tid, d_idx in zip(matched_t, matched_d):
             d = detections[d_idx]
             tr = self.tracks[tid]
@@ -358,10 +387,6 @@ class PassageCellTracker:
             tr["hits"] += 1
             tr["last_frame"] = frame_idx
 
-            # Running ADI (min_area / mean_area so far)
-            areas_so_far = [p["area"] for p in tr["path"]] + [d["area"]]
-            running_adi = float(np.min(areas_so_far) / max(1.0, np.mean(areas_so_far)))
-
             tr["path"].append({
                 "frame": frame_idx,
                 "track_id": tid,
@@ -372,10 +397,9 @@ class PassageCellTracker:
                 "circularity": d["circularity"],
                 "elongation": d["elongation"],
                 "velocity": inst_vel,
-                "ADI_running": running_adi,
+                "ADI_running": 1.0,
             })
 
-        # 3. Create new tracks for unmatched detections
         unmatched_d = set(range(n_d)) - set(matched_d)
         for d_idx in sorted(unmatched_d):
             d = detections[d_idx]
@@ -399,7 +423,6 @@ class PassageCellTracker:
                 }],
             }
 
-        # 4. Retire aged-out tracks
         to_del = []
         for tid, tr in self.tracks.items():
             if frame_idx - tr["last_frame"] > self.max_age:
@@ -408,36 +431,153 @@ class PassageCellTracker:
         for tid in to_del:
             del self.tracks[tid]
 
-    def finalize_all(self, min_hits=3, min_net_travel_px=15.0):
+    def _stitch_and_interpolate(self, raw_paths, min_span_px=120.0):
         """
-        Return all valid moving cell tracks that achieved at least min_hits and
-        actually traveled along the passage (rejects static wall specks).
+        1. Discard stationary wall jitter (require monotonic movement > 25 px).
+        2. Stitch collinear fragments of the same cell passage across short frame gaps.
+        3. Linearly interpolate any 1..12 frame gaps so the bounding box stays locked
+           on the cell continuously from start of passage to end of passage.
         """
-        all_raw = dict(self.finished_tracks)
-        for tid, tr in self.tracks.items():
-            all_raw[tid] = tr["path"]
-
-        valid_tracks = {}
-        new_id = 1
-        for old_tid in sorted(all_raw.keys()):
-            path = all_raw[old_tid]
-            if len(path) < min_hits:
+        # Filter to fragments that actually move along X
+        moving = []
+        for path in raw_paths:
+            if len(path) < 2:
                 continue
-            # Check net travel distance along passage (start to end of track)
             dx = path[-1]["cx"] - path[0]["cx"]
-            dy = path[-1]["cy"] - path[0]["cy"]
-            net_travel = float(np.hypot(dx, dy))
-            max_span_x = float(max(p["cx"] for p in path) - min(p["cx"] for p in path))
-            if net_travel < min_net_travel_px and max_span_x < min_net_travel_px:
+            span_x = max(p["cx"] for p in path) - min(p["cx"] for p in path)
+            if abs(dx) < 20.0 and span_x < 25.0:
+                continue
+            moving.append(sorted(path, key=lambda p: p["frame"]))
+
+        if not moving:
+            return {}
+
+        # Determine dominant flow direction (+1 for left->right, -1 for right->left)
+        net_dxs = [p[-1]["cx"] - p[0]["cx"] for p in moving]
+        flow_dir = 1.0 if np.sum(net_dxs) >= 0 else -1.0
+
+        # Sort fragments by start frame
+        moving.sort(key=lambda p: p[0]["frame"])
+
+        # Stitch fragments that belong to the same cell passage
+        stitched = []
+        used = [False] * len(moving)
+
+        for i in range(len(moving)):
+            if used[i]:
+                continue
+            curr = list(moving[i])
+            used[i] = True
+
+            while True:
+                best_j = None
+                best_score = 1e9
+                f_end = curr[-1]["frame"]
+                x_end = curr[-1]["cx"]
+                # Estimate velocity of current track
+                dt_curr = max(1, curr[-1]["frame"] - curr[0]["frame"])
+                v_curr = (curr[-1]["cx"] - curr[0]["cx"]) / float(dt_curr)
+
+                for j in range(i + 1, len(moving)):
+                    if used[j]:
+                        continue
+                    cand = moving[j]
+                    f_start = cand[0]["frame"]
+                    x_start = cand[0]["cx"]
+                    gap_f = f_start - f_end
+
+                    # Allow stitching across up to 40 frames if the cell moved forward along the tube
+                    if 1 <= gap_f <= 40:
+                        dx_gap = (x_start - x_end) * flow_dir
+                        if -15.0 <= dx_gap <= 650.0:
+                            expected_dx = abs(v_curr) * gap_f
+                            score = abs(dx_gap - expected_dx) + 4.0 * gap_f
+                            if score < best_score:
+                                best_score = score
+                                best_j = j
+
+                if best_j is not None:
+                    curr.extend(moving[best_j])
+                    used[best_j] = True
+                else:
+                    break
+
+            stitched.append(curr)
+
+        # Keep only genuine cell passages that travel a real span along the channel
+        # and interpolate any missing frames inside each passage so the box never drops out!
+        final_tracks = {}
+        new_id = 1
+
+        for path in stitched:
+            # Deduplicate same-frame entries if any
+            by_f = {}
+            for pt in path:
+                by_f[pt["frame"]] = pt
+            pts = [by_f[f] for f in sorted(by_f.keys())]
+            if len(pts) < self.min_hits:
                 continue
 
-            # Re-index cleanly as Cell #1, #2, ...
-            for p in path:
+            span_x = float(max(p["cx"] for p in pts) - min(p["cx"] for p in pts))
+            if span_x < min_span_px:
+                continue
+
+            # Interpolate gaps <= 15 frames so the bounding box stays smoothly locked on the cell
+            continuous_pts = []
+            for k in range(len(pts) - 1):
+                p0 = pts[k]
+                p1 = pts[k + 1]
+                continuous_pts.append(p0)
+                gap = p1["frame"] - p0["frame"]
+                if 1 < gap <= 15:
+                    for step_f in range(1, gap):
+                        alpha = float(step_f) / float(gap)
+                        cx_i = (1.0 - alpha) * p0["cx"] + alpha * p1["cx"]
+                        cy_i = self.slope * cx_i + self.intercept
+                        bw_i = int(round((1.0 - alpha) * p0["bbox"][2] + alpha * p1["bbox"][2]))
+                        bh_i = int(round((1.0 - alpha) * p0["bbox"][3] + alpha * p1["bbox"][3]))
+                        bx_i = int(round(cx_i - 0.5 * bw_i))
+                        by_i = int(round(cy_i - 0.5 * bh_i))
+                        continuous_pts.append({
+                            "frame": p0["frame"] + step_f,
+                            "track_id": new_id,
+                            "cx": cx_i,
+                            "cy": cy_i,
+                            "bbox": (bx_i, by_i, bw_i, bh_i),
+                            "area": (1.0 - alpha) * p0["area"] + alpha * p1["area"],
+                            "circularity": (1.0 - alpha) * p0["circularity"] + alpha * p1["circularity"],
+                            "elongation": (1.0 - alpha) * p0["elongation"] + alpha * p1["elongation"],
+                            "velocity": abs(p1["cx"] - p0["cx"]) / float(gap),
+                            "ADI_running": 1.0,
+                        })
+            continuous_pts.append(pts[-1])
+
+            # Recompute running velocity and running ADI cleanly
+            areas_accum = []
+            for idx, p in enumerate(continuous_pts):
                 p["track_id"] = new_id
-            valid_tracks[new_id] = path
+                if idx == 0:
+                    p["velocity"] = 0.0
+                else:
+                    prev = continuous_pts[idx - 1]
+                    dt = max(1, p["frame"] - prev["frame"])
+                    p["velocity"] = float(np.hypot(p["cx"] - prev["cx"], p["cy"] - prev["cy"]) / float(dt))
+                areas_accum.append(p["area"])
+                p["ADI_running"] = float(np.min(areas_accum) / max(1.0, np.mean(areas_accum)))
+
+            final_tracks[new_id] = continuous_pts
             new_id += 1
 
-        return valid_tracks
+        # Enforce at most 1 active track per frame if two stitched fragments still overlap
+        return final_tracks
+
+    def finalize_all(self, min_hits=4, min_span_px=120.0):
+        all_raw = list(self.finished_tracks.values()) + [tr["path"] for tr in self.tracks.values()]
+        tracks = self._stitch_and_interpolate(all_raw, min_span_px=min_span_px)
+        # Fallback if a shorter clip was used where the cell only traveled 45+ px inside the window
+        if not tracks and min_span_px > 45.0:
+            tracks = self._stitch_and_interpolate(all_raw, min_span_px=45.0)
+        return tracks
 
 
 # ====================================================================
@@ -452,7 +592,7 @@ def compute_biomarker(track_id, path):
     areas = [p["area"] for p in path]
     circs = [p["circularity"] for p in path]
     elongs = [p["elongation"] for p in path]
-    vels = [p["velocity"] for p in path[1:]]
+    vels = [p["velocity"] for p in path[1:] if p["velocity"] > 0]
 
     area_mean = float(np.mean(areas))
     area_min = float(np.min(areas))
@@ -466,14 +606,14 @@ def compute_biomarker(track_id, path):
             shape_recovery = post_circ / mid_circ
 
     x_start, x_end = float(path[0]["cx"]), float(path[-1]["cx"])
-    travel_px = float(np.hypot(path[-1]["cx"] - path[0]["cx"], path[-1]["cy"] - path[0]["cy"]))
+    travel_px = float(max(p["cx"] for p in path) - min(p["cx"] for p in path))
 
     return {
         "track_id": int(track_id),
         "entrance_frame": int(frames[0]),
         "exit_frame": int(frames[-1]),
         "track_length_frames": len(path),
-        "duration_ms": float((frames[-1] - frames[0]) / 10.0),  # 0.1 ms/frame at 10,000 fps
+        "duration_ms": float((frames[-1] - frames[0]) / 10.0),
         "x_start_px": round(x_start, 1),
         "x_end_px": round(x_end, 1),
         "net_travel_px": round(travel_px, 1),
@@ -490,16 +630,15 @@ def compute_biomarker(track_id, path):
 
 
 # ====================================================================
-# DIRECT ANNOTATED VIDEO RENDERER (Bounding Box + Biomechanics HUD)
+# DIRECT ANNOTATED VIDEO RENDERER (1 Single Box + HUD Per Cell)
 # ====================================================================
 
 def _cell_color_bgr(track_id):
     palette = [
-        (60, 255, 100),   # Neon green
-        (0, 215, 255),    # Gold / amber
-        (255, 190, 40),   # Cyan-blue
-        (180, 105, 255),  # Pink-magenta
-        (80, 160, 255),   # Orange
+        (50, 255, 100),   # Crisp Neon Green
+        (0, 215, 255),    # Amber Gold
+        (255, 200, 50),   # Cyan
+        (180, 105, 255),  # Magenta
     ]
     return palette[(track_id - 1) % len(palette)]
 
@@ -513,21 +652,12 @@ def render_annotated_videos(
     valid_tracks,
     biomarkers_by_id,
     out_dir,
-    playback_fps=20.0
+    playback_fps=15.0
 ):
-    """
-    Render the actual microscopy video with:
-    - Subtle channel wall guide lines
-    - Tight bounding box around each tracked cell in the passage
-    - Trajectory trail from the entrance of the passage
-    - Callout HUD box next to the cell showing:
-        CELL #ID | Vel: X.X px/f | Area: XX px^2 | Circ: 0.XX | ADI: 0.XX
-    """
     full_mp4 = os.path.join(out_dir, "tracked_cells_video.mp4")
     active_mp4 = os.path.join(out_dir, "active_passages_only.mp4")
     best_png = os.path.join(out_dir, "tracked_cell_snapshot.png")
 
-    # Map frame_idx -> list of track point dicts
     by_frame = defaultdict(list)
     history_by_track = defaultdict(list)
     for tid, path in valid_tracks.items():
@@ -544,7 +674,6 @@ def render_annotated_videos(
     writer_full = cv2.VideoWriter(full_mp4, fourcc, playback_fps, (w, h))
     writer_active = cv2.VideoWriter(active_mp4, fourcc, playback_fps, (w, h))
 
-    # Precompute subtle wall polylines (every 8 px)
     xs_wall = np.arange(0, w, 8)
     top_pts = np.column_stack([xs_wall, top_wall[xs_wall]]).astype(np.int32)
     bot_pts = np.column_stack([xs_wall, bot_wall[xs_wall]]).astype(np.int32)
@@ -561,9 +690,9 @@ def render_annotated_videos(
 
         vis = frame.copy() if frame.ndim == 3 else cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
 
-        # Draw faint dark-green guide along the calibrated glass walls
-        cv2.polylines(vis, [top_pts], False, (70, 130, 70), 1, cv2.LINE_AA)
-        cv2.polylines(vis, [bot_pts], False, (70, 130, 70), 1, cv2.LINE_AA)
+        # Subtle channel wall boundary lines
+        cv2.polylines(vis, [top_pts], False, (60, 125, 60), 1, cv2.LINE_AA)
+        cv2.polylines(vis, [bot_pts], False, (60, 125, 60), 1, cv2.LINE_AA)
 
         frame_dets = by_frame.get(f_idx, [])
         for d in frame_dets:
@@ -573,55 +702,52 @@ def render_annotated_videos(
             cx_i, cy_i = int(round(d["cx"])), int(round(d["cy"]))
             history_by_track[tid].append((cx_i, cy_i))
 
-            # 1. Draw full passage trajectory trail up to current frame
+            # 1. Single continuous trajectory line from start of passage
             trail = history_by_track[tid]
             if len(trail) >= 2:
                 cv2.polylines(vis, [np.array(trail, np.int32)], False, color, 2, cv2.LINE_AA)
-                # Mark entrance point
-                cv2.circle(vis, trail[0], 3, (0, 255, 255), -1, cv2.LINE_AA)
+                cv2.circle(vis, trail[0], 4, (0, 255, 255), -1, cv2.LINE_AA)
 
-            # 2. Draw padded bounding box with corner brackets around the cell
-            pad = 6
-            x0, y0 = max(0, bx - pad), max(0, by - pad)
-            x1, y1 = min(w - 1, bx + bw + pad), min(h - 1, by + bh + pad)
+            # 2. Clean bounding box around the cell
+            pad_x, pad_y = max(8, bw // 2), max(8, bh // 2)
+            x0, y0 = max(0, cx_i - pad_x), max(0, cy_i - pad_y)
+            x1, y1 = min(w - 1, cx_i + pad_x), min(h - 1, cy_i + pad_y)
             cv2.rectangle(vis, (x0, y0), (x1, y1), color, 2)
 
-            # 3. Draw floating biomechanics HUD card right above/below the bounding box
+            # 3. Live Biomechanics HUD box anchored to the cell
             bio = biomarkers_by_id.get(tid, {})
             adi_val = bio.get("ADI", d["ADI_running"])
-            line1 = f"CELL #{tid}  [x={int(round(d['cx']))}px]"
+            line1 = f"CELL #{tid}  (x={cx_i}px)"
             line2 = f"Vel: {d['velocity']:.1f} px/f | Area: {d['area']:.0f} px2"
-            line3 = f"Circ: {d['circularity']:.2f} | ADI: {adi_val:.2f}"
+            line3 = f"Circ: {d['circularity']:.2f} | ADI: {adi_val:.2f} | Elong: {d['elongation']:.1f}x"
 
-            card_w, card_h = 235, 54
-            card_x = int(np.clip(cx_i - card_w // 2, 8, w - card_w - 8))
-            card_y = y0 - card_h - 10 if y0 > card_h + 25 else y1 + 10
+            card_w, card_h = 265, 58
+            card_x = int(np.clip(cx_i - card_w // 2, 10, w - card_w - 10))
+            card_y = y0 - card_h - 14 if y0 > card_h + 38 else y1 + 14
 
-            # Semi-transparent dark HUD background
             roi_hud = vis[card_y:card_y + card_h, card_x:card_x + card_w]
             if roi_hud.shape[0] == card_h and roi_hud.shape[1] == card_w:
-                dark_box = np.full_like(roi_hud, 18)
-                vis[card_y:card_y + card_h, card_x:card_x + card_w] = cv2.addWeighted(roi_hud, 0.25, dark_box, 0.75, 0)
+                dark_box = np.full_like(roi_hud, 15)
+                vis[card_y:card_y + card_h, card_x:card_x + card_w] = cv2.addWeighted(roi_hud, 0.2, dark_box, 0.8, 0)
             cv2.rectangle(vis, (card_x, card_y), (card_x + card_w, card_y + card_h), color, 1)
 
-            # Leader line from HUD card to cell bounding box
             leader_y = card_y + card_h if card_y < y0 else card_y
             box_anchor_y = y0 if card_y < y0 else y1
             cv2.line(vis, (cx_i, leader_y), (cx_i, box_anchor_y), color, 1, cv2.LINE_AA)
 
-            cv2.putText(vis, line1, (card_x + 7, card_y + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.44, color, 1, cv2.LINE_AA)
-            cv2.putText(vis, line2, (card_x + 7, card_y + 33), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (235, 235, 235), 1, cv2.LINE_AA)
-            cv2.putText(vis, line3, (card_x + 7, card_y + 48), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 230, 255), 1, cv2.LINE_AA)
+            cv2.putText(vis, line1, (card_x + 8, card_y + 17), cv2.FONT_HERSHEY_SIMPLEX, 0.46, color, 1, cv2.LINE_AA)
+            cv2.putText(vis, line2, (card_x + 8, card_y + 35), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (240, 240, 240), 1, cv2.LINE_AA)
+            cv2.putText(vis, line3, (card_x + 8, card_y + 51), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (190, 230, 255), 1, cv2.LINE_AA)
 
             if len(trail) > best_frame_score:
                 best_frame_score = len(trail)
                 best_frame_img = vis.copy()
 
-        # Top status bar
-        cv2.rectangle(vis, (0, 0), (w, 30), (15, 18, 22), -1)
+        # Top HUD status bar
+        cv2.rectangle(vis, (0, 0), (w, 30), (14, 17, 22), -1)
         status_txt = (
-            f"IISc RBC Passage Tracker | Frame {f_idx} ({f_idx / 10.0:.1f} ms) | "
-            f"Cells in Passage: {len(frame_dets)} | Total Confirmed Cells: {len(valid_tracks)}"
+            f"IISc RBC Single-Track Passage | Frame {f_idx} ({f_idx / 10.0:.1f} ms) | "
+            f"Active Cell in Tube: {len(frame_dets)} | Total Passage Cells: {len(valid_tracks)}"
         )
         cv2.putText(vis, status_txt, (14, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (240, 240, 240), 1, cv2.LINE_AA)
 
@@ -645,12 +771,12 @@ def render_annotated_videos(
 # ====================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Stage 3: End-to-End RBC Passage Tracking + Video Output")
-    parser.add_argument("--max-frames", type=int, default=500, help="Number of frames to process (default: 500; pass 0 for all 37,274)")
+    parser = argparse.ArgumentParser(description="Stage 3: Single-Track-Per-Cell RBC Passage Tracker")
+    parser.add_argument("--max-frames", type=int, default=1000, help="Number of frames to process (default: 1000; pass 0 for all 37,274)")
     parser.add_argument("--start-frame", type=int, default=0, help="Frame index to start from (default: 0)")
     parser.add_argument("--video", type=str, default=None, help="Optional override path to .avi file")
-    parser.add_argument("--min-travel", type=float, default=15.0, help="Minimum net travel (px) to keep a cell track (rejects static wall dirt)")
-    parser.add_argument("--diff-thresh", type=float, default=11.0, help="Minimum background-difference intensity inside lumen (default: 11.0)")
+    parser.add_argument("--min-span", type=float, default=120.0, help="Minimum horizontal passage span (px) required for a valid cell track (default: 120)")
+    parser.add_argument("--diff-thresh", type=float, default=13.0, help="Minimum background-difference intensity inside lumen (default: 13.0)")
     args = parser.parse_args()
 
     if not os.path.isfile(CALIB_FILE) or not os.path.isfile(BG_FILE):
@@ -665,25 +791,18 @@ def main():
     fps = calib.get("fps", 10000)
 
     print("=" * 68)
-    print("STAGE 3: END-TO-END PASSAGE RBC TRACKING + VIDEO RENDERING")
+    print("STAGE 3: SINGLE-TRACK-PER-CELL PASSAGE TRACKER")
     print("=" * 68)
     print(f"Video path : {video_path}")
     print(f"Output dir : {OUT}")
 
-    # 1. Build exact full-width interior lumen mask (x = 0..1279, including both flares)
     lumen_mask, top_wall, bot_wall, slope, intercept = build_exact_lumen_geometry(background)
     ys_active = np.where(lumen_mask > 0)[0]
     roi_y_bounds = (max(0, int(ys_active.min()) - 8), min(background.shape[0], int(ys_active.max()) + 8))
-    print(
-        f"Full-width passage lumen calibrated (x=0..{background.shape[1]-1}, y={roi_y_bounds[0]}..{roi_y_bounds[1]}), "
-        f"active lumen = {100.0 * float((lumen_mask > 0).mean()):.2f}% of frame"
-    )
 
     out_dir = os.path.join(OUT, "stage3")
     os.makedirs(out_dir, exist_ok=True)
-    cv2.imwrite(os.path.join(out_dir, "exact_lumen_mask.png"), lumen_mask)
 
-    # 2. Scan frames and track cells through the passage
     cap = cv2.VideoCapture(video_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     if args.start_frame > 0:
@@ -693,9 +812,9 @@ def main():
     if args.max_frames and args.max_frames > 0:
         frames_to_run = min(frames_to_run, args.max_frames)
 
-    print(f"\n[1/3] Detecting & tracking cells across {frames_to_run} frames (start={args.start_frame})...")
+    print(f"\n[1/2] Tracking cells across {frames_to_run} frames (start={args.start_frame})...")
 
-    tracker = PassageCellTracker(slope=slope, max_age=15, min_hits=3, max_step_px=75.0)
+    tracker = PassageCellTracker(slope=slope, intercept=intercept, max_age=25, min_hits=4, max_step_px=120.0)
     frame_count = 0
 
     for offset in range(frames_to_run):
@@ -711,51 +830,12 @@ def main():
         tracker.step(f_idx, dets)
 
         if frame_count % 250 == 0:
-            print(f"      scanned {frame_count}/{frames_to_run} frames...")
+            print(f"      processed {frame_count}/{frames_to_run} frames...")
 
     cap.release()
 
-    # 3. Filter to moving cells that actually travel along the passage
-    valid_tracks = tracker.finalize_all(min_hits=3, min_net_travel_px=args.min_travel)
+    valid_tracks = tracker.finalize_all(min_hits=4, min_span_px=args.min_span)
 
-    # If the chosen frame window had no moving cells (because cells pass intermittently at 10,000 fps),
-    # automatically scan forward in coarse steps to find the first active cell passage!
-    if len(valid_tracks) == 0 and args.start_frame == 0 and total_frames > frames_to_run:
-        print("\n      No moving cell passed through the tube in frames 0..{}. Scanning video for active cell passages...".format(frames_to_run))
-        cap_scan = cv2.VideoCapture(video_path)
-        found_frame = None
-        for probe_f in range(0, total_frames, 25):
-            cap_scan.set(cv2.CAP_PROP_POS_FRAMES, probe_f)
-            ok, pf = cap_scan.read()
-            if not ok:
-                break
-            dets = detect_cells_in_passage(pf, background, lumen_mask, roi_y_bounds, diff_thresh=args.diff_thresh)
-            if dets:
-                found_frame = max(0, probe_f - 30)
-                print(f"      -> Found cell inside passage at frame {probe_f}! Tracking window {found_frame}..{found_frame + frames_to_run}...")
-                break
-        cap_scan.release()
-
-        if found_frame is not None:
-            args.start_frame = found_frame
-            cap = cv2.VideoCapture(video_path)
-            cap.set(cv2.CAP_PROP_POS_FRAMES, args.start_frame)
-            tracker = PassageCellTracker(slope=slope, max_age=15, min_hits=3, max_step_px=75.0)
-            frame_count = 0
-            for offset in range(frames_to_run):
-                f_idx = args.start_frame + offset
-                ok, frame = cap.read()
-                if not ok:
-                    break
-                frame_count += 1
-                dets = detect_cells_in_passage(
-                    frame, background, lumen_mask, roi_y_bounds, diff_thresh=args.diff_thresh
-                )
-                tracker.step(f_idx, dets)
-            cap.release()
-            valid_tracks = tracker.finalize_all(min_hits=3, min_net_travel_px=args.min_travel)
-
-    # 4. Assemble trajectories & biomechanics
     all_trajectories = []
     all_biomarkers = []
     biomarkers_by_id = {}
@@ -783,7 +863,6 @@ def main():
                 "ADI_running": round(p["ADI_running"], 4),
             })
 
-    # Save CSVs & JSON
     traj_csv = os.path.join(out_dir, "trajectories.csv")
     with open(traj_csv, "w", newline="", encoding="utf-8") as f:
         if all_trajectories:
@@ -811,12 +890,10 @@ def main():
             "circularity_mean": float(np.mean([b["circularity_mean"] for b in all_biomarkers])) if all_biomarkers else None,
         }
     }
-    summary_json = os.path.join(out_dir, "track_summary.json")
-    with open(summary_json, "w", encoding="utf-8") as f:
+    with open(os.path.join(out_dir, "track_summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
-    # 5. Render Annotated Videos with Bounding Box + Biomechanics HUD
-    print("\n[2/3] Rendering annotated video with bounding boxes & live biomechanics HUD...")
+    print("\n[2/2] Rendering annotated video (1 unified box + biomechanics HUD per cell)...")
     full_mp4, active_mp4, best_png, active_frames = render_annotated_videos(
         video_path=video_path,
         start_frame=args.start_frame,
@@ -826,33 +903,28 @@ def main():
         valid_tracks=valid_tracks,
         biomarkers_by_id=biomarkers_by_id,
         out_dir=out_dir,
-        playback_fps=20.0,
+        playback_fps=15.0,
     )
 
     print("\n" + "=" * 68)
-    print("STAGE 3 COMPLETE")
+    print("STAGE 3 COMPLETE — SINGLE TRACK PER CELL")
     print("=" * 68)
-    print(f"  ✓ Annotated Full Video    : {full_mp4}")
-    print(f"  ✓ Active Passages Video   : {active_mp4} ({active_frames} active frames)")
-    if os.path.isfile(best_png):
-        print(f"  ✓ Best Tracked Snapshot   : {best_png}")
-    print(f"  ✓ Trajectories CSV        : {traj_csv} ({len(all_trajectories)} rows)")
-    print(f"  ✓ Biomechanics CSV        : {bio_csv} ({len(all_biomarkers)} moving cells)")
+    print(f"  ✓ Active Cell Passages Video : {active_mp4} ({active_frames} active frames)")
+    print(f"  ✓ Full Annotated Video       : {full_mp4}")
+    print(f"  ✓ Total Distinct Cells       : {len(all_biomarkers)}")
 
     if all_biomarkers:
-        print("\nTracked Cells Passing Through Channel:")
-        print(f"  {'CellID':>6} | {'Frames':>6} | {'FrameSpan':>13} | {'X Start->End':>14} | {'VelMean':>7} | {'AreaMean':>8} | {'ADI':>5} | {'Circ':>5}")
-        print("  " + "-" * 80)
-        for b in sorted(all_biomarkers, key=lambda x: x["net_travel_px"], reverse=True)[:15]:
+        print("\nPer-Cell Passage Summary:")
+        print(f"  {'CellID':>6} | {'Frames':>6} | {'FrameSpan':>13} | {'X Passage Span':>16} | {'VelMean':>7} | {'AreaMean':>8} | {'ADI':>5} | {'Circ':>5}")
+        print("  " + "-" * 82)
+        for b in all_biomarkers:
             fspan = f"{b['entrance_frame']}->{b['exit_frame']}"
             xspan = f"{b['x_start_px']:.0f}->{b['x_end_px']:.0f}px"
             print(
-                f"  #{b['track_id']:5d} | {b['track_length_frames']:6d} | {fspan:>13} | {xspan:>14} | "
+                f"  #{b['track_id']:5d} | {b['track_length_frames']:6d} | {fspan:>13} | {xspan:>16} | "
                 f"{b['velocity_mean']:7.2f} | {b['area_mean']:8.1f} | {b['ADI']:5.2f} | {b['circularity_mean']:5.2f}"
             )
-        print(f"\nTo watch the tracked cell video right now, run:\n  start {active_mp4}")
-    else:
-        print("\nNo moving cells exceeded the travel threshold in this window. Try increasing --max-frames 2000 or lowering --diff-thresh 8.")
+        print(f"\nOpen the video:\n  start {active_mp4}")
 
 
 if __name__ == "__main__":

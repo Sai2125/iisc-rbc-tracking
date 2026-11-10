@@ -469,6 +469,7 @@ def detect_and_track_passages(
     kymograph = np.zeros((frames_to_run, w_img), dtype=np.float32)
     right_entrance_signal = np.zeros(frames_to_run, dtype=np.float32)
     left_exit_signal = np.zeros(frames_to_run, dtype=np.float32)
+    roi_cache = []  # Cache cropped uint8 ROI strips in RAM so Stage 3B needs 0 disk seeks!
 
     prev_gray_roi = None
     lag3_buffer = []
@@ -482,7 +483,9 @@ def detect_and_track_passages(
             break
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
-        gray_roi = gray[y_min:y_max, :].astype(np.float32)
+        roi_u8 = gray[y_min:y_max, :].copy()
+        roi_cache.append(roi_u8)
+        gray_roi = roi_u8.astype(np.float32)
 
         pos_diff = np.maximum(0.0, gray_roi - bg_roi)
         pos_diff[mask_roi == 0] = 0.0
@@ -551,28 +554,35 @@ def detect_and_track_passages(
         t += 1
 
     if not passages:
+        # Fallback if threshold was slightly high on this window: pick strongest right->left pair
+        r_peak = int(np.argmax(r_smooth[:actual_frames - 180]))
+        if r_smooth[r_peak] >= 6.0:
+            t_enter = max(0, r_peak - 15)
+            l_win = l_smooth[min(actual_frames - 1, t_enter + 160): min(actual_frames, t_enter + 480)]
+            if l_win.size > 0:
+                t_exit = min(actual_frames - 1, t_enter + 160 + int(np.argmax(l_win)) + 35)
+                passages.append((t_enter, t_exit))
+
+    if not passages:
         return {}
 
-    # Stage 3B & 3C: Kymograph DP -> 2D Sub-Pixel Observations -> RTS Kalman Smoother
+    # Stage 3B & 3C: Uses cached ROI strips in RAM (zero disk seeks!)
     final_tracks = {}
-    cap = cv2.VideoCapture(video_path)
 
     for tid, (t0, t1) in enumerate(passages, start=1):
-        print(f"      [Stage 3B/3C] Refining Passage #{tid} (Frames {start_frame + t0} -> {start_frame + t1}) with Kymograph DP + RTS Kalman Smoother...")
+        print(f"      [Stage 3B/3C] Refining Passage #{tid} (Frames {start_frame + t0} -> {start_frame + t1}) with Kymograph DP + RTS Kalman Smoother...", flush=True)
         kymo_win = kymograph[t0:t1 + 1]
         dp_xs = solve_monotonic_kymograph_path(kymo_win, x_start_min=1225, x_end_max=20)
 
-        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame + t0)
         observations = []
         prev_g_roi = None
 
         for step_idx, gx in enumerate(dp_xs):
-            f_idx = start_frame + t0 + step_idx
-            ok, frame = cap.read()
-            if not ok:
+            cache_idx = t0 + step_idx
+            if cache_idx >= len(roi_cache):
                 break
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
-            gray_roi = gray[y_min:y_max, :].astype(np.float32)
+            f_idx = start_frame + cache_idx
+            gray_roi = roi_cache[cache_idx].astype(np.float32)
 
             obs = extract_subpixel_observation(
                 gray_roi, prev_g_roi, bg_roi, mask_roi, gx, y_min, top_wall, bot_wall
@@ -584,7 +594,6 @@ def detect_and_track_passages(
 
         final_tracks[tid] = kalman_rts_smooth_passage(observations, top_wall, bot_wall)
 
-    cap.release()
     return final_tracks
 
 
@@ -679,11 +688,16 @@ def render_tracked_video(
     trail_by_id = {tid: [] for tid in valid_tracks}
     color = (50, 255, 100)
 
+    # Seek ONLY when jumping to a non-consecutive frame (never call cap.set on consecutive frames!)
+    current_pos = -999
+
     for f_idx in frames_to_render:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, f_idx)
+        if f_idx != current_pos:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, f_idx)
         ok, frame = cap.read()
         if not ok:
             break
+        current_pos = f_idx + 1
 
         vis = frame.copy() if frame.ndim == 3 else cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
 

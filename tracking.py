@@ -193,19 +193,18 @@ def extract_next_passage_from_kymograph(
     return actual_t_enter, dp_xs
 
 
-def trace_single_cell_dp_ridge(kymo_full, t_enter, l_smooth, l_thresh, x_start_min=1230, x_exit_cutoff=14):
+def trace_single_cell_dp_ridge(kymo_full, t_enter, l_smooth, l_thresh, x_start_min=1225, x_exit_cutoff=12):
     """
     Given a cell's entrance frame `t_enter`, solve for its individual right-to-left
-    trajectory ridge across the kymograph and find its OWN exit frame `t_exit` (rather
-    than blindly taking argmax over a 460-frame window, which previously confused
-    Cell #2's exit with Cell #3's exit!).
-
-    Once solved, cuts off the trajectory immediately as soon as the cell reaches
-    `x <= x_exit_cutoff` (14 px) so the box never lingers or goes haywire at x = 3..9 px!
+    trajectory ridge across the kymograph using physically bounded velocities:
+      - In flares (x > 1180 or x < 110): cell speed is 0..4 px/frame (target ~1.35 px/frame)
+      - In narrow bore (110 <= x <= 1180): cell speed is 2..9 px/frame (target ~5.45 px/frame)
+    Because `max_step` is physically capped (<= 9 px/frame in bore, <= 4 px/frame in flares),
+    the box can NEVER abandon the cell and sprint ahead at 17-24 px/frame!
     """
     T_total, W = kymo_full.shape
-    max_duration = min(430, T_total - t_enter)
-    if max_duration < 160:
+    max_duration = min(435, T_total - t_enter)
+    if max_duration < 260:
         return None, None
 
     k_win = kymo_full[t_enter: t_enter + max_duration]
@@ -217,20 +216,23 @@ def trace_single_cell_dp_ridge(kymo_full, t_enter, l_smooth, l_thresh, x_start_m
     # Start in the bottom-right entrance zone [x_start_min .. W-1]
     dp[0, x_start_min:] = k_smooth[0, x_start_min:] * 2.5
 
-    max_step = 24
+    max_step_bore = 9
     for t in range(1, max_duration):
         prev_row = dp[t - 1]
         best_val = np.full(W, -1e12, dtype=np.float64)
         best_prev = np.arange(W, dtype=np.int32)
 
-        for step in range(0, max_step + 1):
+        for step in range(0, max_step_bore + 1):
             limit = W - step
-            cand_prev = prev_row[step:]
             x_coords = np.arange(limit)
             in_bore = (x_coords >= 110) & (x_coords <= 1180)
-            target_step = np.where(in_bore, 5.4, 1.35)
-            step_penalty = 0.22 * ((step - target_step) ** 2)
 
+            # Enforce physical speed bounds: in flares step <= 4 px/frame; in bore 2 <= step <= 9 px/frame
+            valid_step = np.where(in_bore, (step >= 1) & (step <= 9), step <= 4)
+            target_step = np.where(in_bore, 5.45, 1.30)
+            step_penalty = np.where(valid_step, 0.35 * ((step - target_step) ** 2), 1e9)
+
+            cand_prev = prev_row[step:]
             score = cand_prev - step_penalty
             better = score > best_val[:limit]
             best_val[:limit] = np.where(better, score, best_val[:limit])
@@ -239,53 +241,48 @@ def trace_single_cell_dp_ridge(kymo_full, t_enter, l_smooth, l_thresh, x_start_m
         dp[t] = best_val + k_smooth[t]
         back[t] = best_prev
 
-    # Find the earliest valid exit time `t_rel` in [180 .. max_duration-1] where the DP path
-    # reaches the left exit zone [0 .. 22] with strong average per-frame score and a local left-flare exit signal
+    # A full passage across 1280 px at physical speeds takes between 300 and 425 frames.
+    min_exit_t = min(300, max_duration - 20)
     best_t_rel = None
     best_exit_score = -1e12
 
-    for t_rel in range(185, max_duration):
+    for t_rel in range(min_exit_t, max_duration):
         f_global = t_enter + t_rel
-        # Normalize path score by length so earlier (true) exits aren't beaten by lingering at x=0
-        avg_dp_score = float(dp[t_rel, :22].max()) / float(t_rel)
-        left_bonus = 0.6 * float(l_smooth[f_global])
+        # Score at the left exit opening (x in 0..18)
+        dp_val = float(dp[t_rel, :18].max())
+        if dp_val <= -1e8:
+            continue
+        avg_dp_score = dp_val / float(t_rel)
+        left_bonus = 0.5 * float(l_smooth[f_global]) if f_global < len(l_smooth) else 0.0
         total_score = avg_dp_score + left_bonus
-        if l_smooth[f_global] >= 0.65 * l_thresh and total_score > best_exit_score:
+        if total_score > best_exit_score:
             best_exit_score = total_score
             best_t_rel = t_rel
-            # Once we pass a clear local peak in l_smooth that starts dropping, stop so we don't jump to the NEXT cell's exit!
-            if t_rel > 220 and l_smooth[f_global] < 0.75 * l_smooth[max(t_enter + 185, f_global - 12): f_global + 1].max():
-                break
 
     if best_t_rel is None:
-        # Fallback to best normalized score in [200 .. max_duration-1]
-        scores = [float(dp[tr, :22].max()) / float(tr) for tr in range(200, max_duration)]
-        if not scores:
-            return None, None
-        best_t_rel = 200 + int(np.argmax(scores))
+        return None, None
 
     # Backtrack from best_t_rel
     T_len = best_t_rel + 1
-    end_x = int(np.argmax(dp[best_t_rel, :22]))
+    end_x = int(np.argmax(dp[best_t_rel, :18]))
     path_x = [0] * T_len
     path_x[T_len - 1] = end_x
     for t in range(T_len - 1, 0, -1):
         path_x[t - 1] = int(back[t, path_x[t]])
 
-    # Trim any leading stationary frames where the DP waited at x > 1250 for a later cell
+    # Trim any leading stationary frames at the right edge
     start_trim = 0
     while start_trim + 10 < T_len and (path_x[start_trim] - path_x[start_trim + 8]) < 3:
         start_trim += 1
 
-    # Trim any trailing frames once the cell has reached x <= x_exit_cutoff (14 px)
-    # so the ending NEVER goes haywire at x = 3..9 px after the cell exits!
+    # Cut off cleanly the moment the cell reaches x <= x_exit_cutoff (12 px)
     end_trim = T_len - 1
     for idx in range(start_trim, T_len):
         if path_x[idx] <= x_exit_cutoff:
             end_trim = idx
             break
 
-    if end_trim - start_trim < 120:
+    if end_trim - start_trim < 180:
         return None, None
 
     trimmed_x = [float(x) for x in path_x[start_trim: end_trim + 1]]
@@ -296,8 +293,8 @@ def trace_single_cell_dp_ridge(kymo_full, t_enter, l_smooth, l_thresh, x_start_m
 def peel_ridge_from_kymograph(kymograph, t_enter, path_x, half_width_x=34, half_time_t=10):
     """
     Erase (zero out) a tracked cell's full 2D space-time footprint (±34 px by ±10 frames)
-    from `kymograph` so the leading/trailing motion lobes of the SAME cell can never be
-    re-extracted as a duplicate track!
+    AND its left-flare exit window so neither its entrance halo nor its exit halo can
+    interfere with the next cell!
     """
     T_total, W = kymograph.shape
     for idx, x_val in enumerate(path_x):
@@ -307,8 +304,10 @@ def peel_ridge_from_kymograph(kymograph, t_enter, path_x, half_width_x=34, half_
         x0 = max(0, int(round(x_val)) - half_width_x)
         x1 = min(W, int(round(x_val)) + half_width_x + 1)
         kymograph[t0:t1, x0:x1] = 0.0
-    # Also clear the right-flare entrance window for ±18 frames around t_enter
+    # Clear right-flare entrance window (±18 frames) and left-flare exit window (±28 frames)
+    t_exit = t_enter + len(path_x) - 1
     kymograph[max(0, t_enter - 18): min(T_total, t_enter + 22), 1185:] = 0.0
+    kymograph[max(0, t_exit - 25): min(T_total, t_exit + 35), :115] = 0.0
 
 
 def is_duplicate_trajectory(cand_t0, cand_xs, accepted_list, min_spatial_sep_px=45.0, min_time_sep_frames=22):

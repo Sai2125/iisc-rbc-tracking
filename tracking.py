@@ -528,28 +528,54 @@ def detect_and_track_passages(
     if actual_frames < 20:
         return {}
 
+    # Subtract temporal median baseline from each column of the kymograph so any persistent
+    # static wall residual is 0.0 and only true transient cell passages stand out!
+    col_baseline = np.median(kymograph, axis=0, keepdims=True)
+    kymograph = np.maximum(0.0, kymograph - col_baseline)
+
+    right_entrance_signal = kymograph[:, 1215:1278].max(axis=1)
+    left_exit_signal = kymograph[:, 5:105].max(axis=1)
+
     r_smooth = np.convolve(right_entrance_signal, np.ones(7) / 7.0, mode="same")
     l_smooth = np.convolve(left_exit_signal, np.ones(7) / 7.0, mode="same")
+
+    # Robust threshold: median + 3.5 * MAD (or minimum floor 8.0)
+    r_med = float(np.median(r_smooth))
+    r_mad = float(np.median(np.abs(r_smooth - r_med))) + 1e-3
+    r_thresh = max(8.0, r_med + 3.5 * r_mad)
+
+    l_med = float(np.median(l_smooth))
+    l_mad = float(np.median(np.abs(l_smooth - l_med))) + 1e-3
+    l_thresh = max(8.0, l_med + 3.5 * l_mad)
 
     passages = []
     t = 0
     while t < actual_frames - 150:
-        if r_smooth[t] >= 14.0:
-            t_enter = t
-            while t_enter > 0 and right_entrance_signal[t_enter - 1] >= 9.0:
+        if r_smooth[t] >= r_thresh:
+            # Find local peak of right-flare entrance within [t .. t + 60]
+            r_win = r_smooth[t: min(actual_frames, t + 60)]
+            t_peak_r = t + int(np.argmax(r_win))
+            # Walk back at most 25 frames to capture the very first frame the cell enters at x=1277
+            t_enter = t_peak_r
+            min_back = max(0, t_peak_r - 25)
+            while t_enter > min_back and right_entrance_signal[t_enter - 1] >= 0.4 * r_thresh:
                 t_enter -= 1
 
-            search_end = min(actual_frames, t_enter + 480)
-            exit_window = l_smooth[min(actual_frames - 1, t_enter + 160): search_end]
-            if exit_window.size > 0 and float(exit_window.max()) >= 14.0:
+            # Look for corresponding left-flare exit between t_peak_r + 140 and t_peak_r + 460
+            w_start = min(actual_frames - 1, t_peak_r + 140)
+            w_end = min(actual_frames, t_peak_r + 460)
+            exit_window = l_smooth[w_start:w_end]
+            if exit_window.size > 0 and float(exit_window.max()) >= l_thresh:
                 rel_peak = int(np.argmax(exit_window))
-                t_exit_peak = min(actual_frames - 1, t_enter + 160 + rel_peak)
+                t_exit_peak = w_start + rel_peak
+                # Walk forward at most 65 frames while cell finishes exiting x -> 0
                 t_exit = t_exit_peak
-                while t_exit + 1 < min(actual_frames, t_exit_peak + 110) and left_exit_signal[t_exit + 1] >= 9.5:
+                max_fwd = min(actual_frames - 1, t_exit_peak + 65)
+                while t_exit < max_fwd and left_exit_signal[t_exit + 1] >= 0.35 * l_thresh:
                     t_exit += 1
 
                 passages.append((t_enter, t_exit))
-                t = t_exit + 30
+                t = max(t + 1, t_exit + 30)
                 continue
         t += 1
 

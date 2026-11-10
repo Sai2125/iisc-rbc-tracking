@@ -300,7 +300,8 @@ class PassageCellTracker:
         matched_d = []
 
         if n_t > 0 and n_d > 0:
-            cost = np.full((n_t, n_d), np.inf, dtype=np.float64)
+            BIG_COST = 1e6
+            cost = np.full((n_t, n_d), BIG_COST, dtype=np.float64)
             for i, tid in enumerate(track_ids):
                 tr = self.tracks[tid]
                 pred = tr["kf"].statePre.reshape(-1)
@@ -321,23 +322,23 @@ class PassageCellTracker:
 
                     # Penalize perpendicular jumps heavily (cells cannot jump through glass walls)
                     if dn <= 18.0 and (ds <= self.max_step_px or raw_dist <= self.max_step_px):
-                        cost[i, j] = ds + 3.5 * dn
+                        cost[i, j] = min(ds, raw_dist) + 3.5 * dn
 
-            # Solve assignment
+            # Solve assignment (finite BIG_COST avoids scipy 'cost matrix is infeasible' ValueError)
             try:
                 from scipy.optimize import linear_sum_assignment
                 r_ind, c_ind = linear_sum_assignment(cost)
-            except ImportError:
+            except Exception:
                 r_ind, c_ind = [], []
                 work = cost.copy()
                 for _ in range(min(n_t, n_d)):
                     r, c = np.unravel_index(np.argmin(work), work.shape)
-                    if not np.isfinite(work[r, c]):
+                    if work[r, c] >= BIG_COST:
                         break
                     r_ind.append(int(r))
                     c_ind.append(int(c))
-                    work[r, :] = np.inf
-                    work[:, c] = np.inf
+                    work[r, :] = BIG_COST
+                    work[:, c] = BIG_COST
 
             for r, c in zip(r_ind, c_ind):
                 if cost[r, c] < self.max_step_px:

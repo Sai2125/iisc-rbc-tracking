@@ -7,13 +7,35 @@ Run this once to generate:
 """
 import cv2
 import numpy as np
-import json, os
+import json, os, sys
+from pathlib import Path
 
 # ====================================================================
-# PATHS
+# PATHS (Auto-detected across machines, with CLI / env override)
 # ====================================================================
-VIDEO = r"C:\Users\amara\Downloads\2A002 2_C001H001S0001-001.avi"
-OUT = r"C:\Users\amara\rbc_tracking\output"
+ROOT_DIR = Path(__file__).resolve().parent
+VIDEO_FILENAME = "2A002 2_C001H001S0001-001.avi"
+
+
+def resolve_video_path():
+    if len(sys.argv) > 1 and os.path.isfile(sys.argv[1]):
+        return str(Path(sys.argv[1]).resolve())
+    candidates = [
+        ROOT_DIR / VIDEO_FILENAME,
+        ROOT_DIR.parent / VIDEO_FILENAME,
+        Path.home() / "Documents" / "IIsc" / VIDEO_FILENAME,
+        Path.home() / "Desktop" / "rbctrack" / VIDEO_FILENAME,
+        Path.home() / "Downloads" / VIDEO_FILENAME,
+        Path(r"C:\Users\amara\Downloads") / VIDEO_FILENAME,
+    ]
+    for c in candidates:
+        if c.is_file():
+            return str(c.resolve())
+    return str(ROOT_DIR / VIDEO_FILENAME)
+
+
+VIDEO = resolve_video_path()
+OUT = str(ROOT_DIR / "output")
 FPS = 10000  # from .cihx metadata
 
 
@@ -23,8 +45,16 @@ FPS = 10000  # from .cihx metadata
 
 def build_median_background(video_path, n_samples=150):
     """Temporal median across evenly spaced frames."""
+    if not os.path.isfile(video_path):
+        raise FileNotFoundError(
+            f"Could not find AVI file at: {video_path}\n"
+            f"Place '{VIDEO_FILENAME}' in {ROOT_DIR} or pass its path: python preprocessing.py <path_to_avi>"
+        )
     cap = cv2.VideoCapture(video_path)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total <= 0:
+        cap.release()
+        raise RuntimeError(f"OpenCV could not read frames from {video_path}")
     step = max(1, total // n_samples)
     frames = []
     for idx in range(0, total, step):
@@ -162,6 +192,8 @@ def main():
     print("=" * 60)
     print("STAGE 1: PREPROCESSING + CALIBRATION")
     print("=" * 60)
+    print(f"Video path : {VIDEO}")
+    print(f"Output dir : {OUT}")
 
     print("\n[1/3] Building median background ...", flush=True)
     bg, n_used, total_frames = build_median_background(VIDEO, n_samples=150)
@@ -222,7 +254,7 @@ def main():
     print("=" * 60)
     print("\nNext steps:")
     print("  1. Inspect output/preprocessed/ to verify signal quality")
-    print("  2. Proceed to Stage 3: Detection + Tracking implementation")
+    print("  2. Proceed to Stage 3: python tracking.py")
 
 
 if __name__ == "__main__":

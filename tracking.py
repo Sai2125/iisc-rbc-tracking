@@ -13,14 +13,44 @@ Output files:
 """
 import cv2
 import numpy as np
-import json, os, csv, multiprocessing
+import json, os, csv, argparse, multiprocessing
+from pathlib import Path
 from multiprocessing import Pool
 from collections import defaultdict
 
 # ====================================================================
-# PATHS
+# PATHS (Auto-detected relative to repo root, with fallback)
 # ====================================================================
-OUT = r"C:\Users\amara\rbc_tracking\output"
+ROOT_DIR = Path(__file__).resolve().parent
+VIDEO_FILENAME = "2A002 2_C001H001S0001-001.avi"
+
+
+def _resolve_out_dir():
+    local_out = ROOT_DIR / "output"
+    legacy_out = Path(r"C:\Users\amara\rbc_tracking\output")
+    if (local_out / "calibration.json").is_file() or not (legacy_out / "calibration.json").is_file():
+        return str(local_out)
+    return str(legacy_out)
+
+
+def _resolve_video_path(calib_video_path):
+    if calib_video_path and os.path.isfile(calib_video_path):
+        return calib_video_path
+    candidates = [
+        ROOT_DIR / VIDEO_FILENAME,
+        ROOT_DIR.parent / VIDEO_FILENAME,
+        Path.home() / "Documents" / "IIsc" / VIDEO_FILENAME,
+        Path.home() / "Desktop" / "rbctrack" / VIDEO_FILENAME,
+        Path.home() / "Downloads" / VIDEO_FILENAME,
+        Path(r"C:\Users\amara\Downloads") / VIDEO_FILENAME,
+    ]
+    for c in candidates:
+        if c.is_file():
+            return str(c.resolve())
+    return calib_video_path
+
+
+OUT = _resolve_out_dir()
 CALIB_FILE = os.path.join(OUT, "calibration.json")
 BG_FILE = os.path.join(OUT, "median_bg.npy")
 VIDEO = None  # Will be read from calibration.json
@@ -449,16 +479,29 @@ def compute_biomarker(track_path, width_profile, track_id=None):
 # ====================================================================
 
 def main():
+    parser = argparse.ArgumentParser(description="Stage 3: RBC Detection + Tracking")
+    parser.add_argument("--max-frames", type=int, default=None, help="Optional cap on frames to process (e.g. 500 for quick test)")
+    parser.add_argument("--start-frame", type=int, default=0, help="Frame index to start from (default: 0)")
+    parser.add_argument("--video", type=str, default=None, help="Optional override path to .avi file")
+    args = parser.parse_args()
+
+    if not os.path.isfile(CALIB_FILE) or not os.path.isfile(BG_FILE):
+        print(f"Calibration files not found in {OUT}. Running preprocessing.py (Stage 1) first...")
+        import preprocessing
+        preprocessing.main()
+
     calib = load_calibration()
     background = load_background()
 
-    VIDEO = calib["video"]
+    VIDEO = args.video if args.video else _resolve_video_path(calib.get("video"))
     fps = calib["fps"]
     width_profile = calib["width_profile"]
 
     print("=" * 60)
     print("STAGE 3: DETECTION + TRACKING")
     print("=" * 60)
+    print(f"Video path : {VIDEO}")
+    print(f"Output dir : {OUT}")
 
     # Initialize tracker
     tracker = CellTracker(max_age=100, min_hits=3)
@@ -474,11 +517,17 @@ def main():
     # Video capture
     cap = cv2.VideoCapture(VIDEO)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if args.start_frame > 0:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, args.start_frame)
+    frames_to_run = total_frames - args.start_frame
+    if args.max_frames is not None:
+        frames_to_run = min(frames_to_run, args.max_frames)
 
-    print(f"\nProcessing {total_frames} frames at {fps} fps...")
+    print(f"\nProcessing {frames_to_run} frames (from frame {args.start_frame} of {total_frames}) at {fps} fps...")
 
     frame_count = 0
-    for i in range(total_frames):
+    for offset in range(frames_to_run):
+        i = args.start_frame + offset
         ok, frame = cap.read()
         if not ok:
             break

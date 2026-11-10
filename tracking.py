@@ -70,13 +70,13 @@ def load_background():
 # DETECTION: Background Subtraction + Otsu + Watershed
 # ====================================================================
 
-def detect_cells(frame, background, width_profile_dict, verbose=False):
+def detect_cells(frame, background, width_profile_dict, y_margin=12.0, corridor_mask=None, verbose=False):
     """
     Detect cells in a single frame using:
-    1. Background subtraction
-    2. Otsu thresholding (adaptive per frame)
+    1. Background subtraction (masked to channel corridor if provided)
+    2. Otsu thresholding (adaptive per frame, with noise floor)
     3. Connected components with watershed for touching cells
-    4. Morphological filtering
+    4. Morphological + channel centerline Y-gate filtering
 
     Returns: list of (center_x, center_y, area, circularity)
     """
@@ -86,15 +86,24 @@ def detect_cells(frame, background, width_profile_dict, verbose=False):
     diff = np.clip(diff, -50, 50)  # Limit outliers
     diff = np.abs(diff)
 
+    # Zero out outer bath before Otsu & Distance Transform so bath cells
+    # do not skew the frame threshold or dist.max()
+    if corridor_mask is not None:
+        diff = diff * corridor_mask
+
     # 2. Edge-preserving blur
     diff_uint8 = cv2.convertScaleAbs(diff.astype(np.uint8), alpha=1.5, beta=0)
     diff_blur = cv2.bilateralFilter(diff_uint8, d=9, sigmaColor=75, sigmaSpace=3)
 
-    # 3. Otsu thresholding (auto-threshold per frame)
-    _, thresh = cv2.threshold(
+    # 3. Otsu thresholding (auto-threshold per frame, with minimum noise floor of 8)
+    otsu_val, thresh = cv2.threshold(
         diff_blur.astype(np.uint8), 0, 255,
         cv2.THRESH_BINARY + cv2.THRESH_OTSU
     )
+    if otsu_val < 8:
+        _, thresh = cv2.threshold(diff_blur.astype(np.uint8), 8, 255, cv2.THRESH_BINARY)
+    if corridor_mask is not None:
+        thresh = cv2.bitwise_and(thresh, corridor_mask)
 
     # 4. Morphological operations
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
@@ -103,6 +112,8 @@ def detect_cells(frame, background, width_profile_dict, verbose=False):
 
     # 5. Distance transform + watershed for touching cells
     dist = cv2.distanceTransform(thresh, cv2.DIST_L2, 5)
+    if dist.max() <= 0:
+        return []
     _, dist_thresh = cv2.threshold(
         dist, 0.5 * dist.max(), 255, 0
     )
@@ -177,10 +188,14 @@ def detect_cells(frame, background, width_profile_dict, verbose=False):
         cx = int(M["m10"] / M["m00"])
         cy = int(M["m01"] / M["m00"])
 
-        # Check if inside channel (verify with width profile)
-        # Get local channel width at this x position
-        local_width = get_local_width(width_profile_dict, float(cx))
-        if local_width is None:
+        # Check if inside channel (verify both X span AND perpendicular Y distance to centerline!)
+        bounds = get_local_channel_bounds(width_profile_dict, float(cx))
+        if bounds is None:
+            continue
+        local_y, local_width, cos_theta = bounds
+        perp_dist = abs(float(cy) - local_y) * cos_theta
+        max_allowed_dist = (0.5 * local_width) + float(y_margin)
+        if perp_dist > max_allowed_dist:
             continue
 
         # Compute circularity
@@ -194,25 +209,67 @@ def detect_cells(frame, background, width_profile_dict, verbose=False):
     return cell_data
 
 
-def get_local_width(width_profile, x_coord):
-    """Interpolate channel width at x position."""
+def get_local_channel_bounds(width_profile, x_coord):
+    """Interpolate channel centerline Y and width at x_coord. Returns (y_center, width_px, cos_theta)."""
     if not width_profile:
         return None
 
     xs = [p["x"] for p in width_profile]
+    ys = [p["y"] for p in width_profile]
     widths = [p["width_px"] for p in width_profile]
 
     if x_coord < xs[0] or x_coord > xs[-1]:
         return None
 
+    # Estimate slope for perpendicular distance projection
+    dx_total = xs[-1] - xs[0]
+    slope = (ys[-1] - ys[0]) / dx_total if dx_total > 0 else 0.0
+    cos_theta = 1.0 / np.sqrt(1.0 + slope * slope)
+
     # Linear interpolation
     for i in range(len(xs) - 1):
         if xs[i] <= x_coord <= xs[i + 1]:
-            t = (x_coord - xs[i]) / (xs[i + 1] - xs[i])
+            span = xs[i + 1] - xs[i]
+            t = (x_coord - xs[i]) / span if span > 0 else 0.0
+            y_c = ys[i] + t * (ys[i + 1] - ys[i])
             w = widths[i] + t * (widths[i + 1] - widths[i])
-            return w
+            return y_c, w, cos_theta
 
     return None
+
+
+def get_local_width(width_profile, x_coord):
+    """Interpolate channel width at x position (backwards-compatible helper)."""
+    res = get_local_channel_bounds(width_profile, x_coord)
+    return res[1] if res is not None else None
+
+
+def build_channel_corridor_mask(shape_hw, width_profile, y_margin=12.0):
+    """Build a binary uint8 mask (0 or 1) covering the channel lumen + margin along the width profile."""
+    if not width_profile:
+        return None
+    h, w = shape_hw[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+    xs = [p["x"] for p in width_profile]
+    ys = [p["y"] for p in width_profile]
+    widths = [p["width_px"] for p in width_profile]
+
+    dx_total = xs[-1] - xs[0]
+    slope = (ys[-1] - ys[0]) / dx_total if dx_total > 0 else 0.0
+    cos_theta = 1.0 / np.sqrt(1.0 + slope * slope)
+
+    x_min = max(0, int(np.floor(xs[0])))
+    x_max = min(w - 1, int(np.ceil(xs[-1])))
+    x_grid = np.arange(x_min, x_max + 1, dtype=np.float64)
+    y_centers = np.interp(x_grid, xs, ys)
+    w_interp = np.interp(x_grid, xs, widths)
+    half_band_y = (0.5 * w_interp + float(y_margin)) / max(cos_theta, 1e-6)
+
+    for idx, x_val in enumerate(x_grid.astype(int)):
+        y0 = max(0, int(np.floor(y_centers[idx] - half_band_y[idx])))
+        y1 = min(h, int(np.ceil(y_centers[idx] + half_band_y[idx])) + 1)
+        mask[y0:y1, x_val] = 1
+    return mask
 
 
 # ====================================================================
@@ -498,6 +555,7 @@ def main():
     parser.add_argument("--max-frames", type=int, default=None, help="Optional cap on frames to process (e.g. 500 for quick test)")
     parser.add_argument("--start-frame", type=int, default=0, help="Frame index to start from (default: 0)")
     parser.add_argument("--video", type=str, default=None, help="Optional override path to .avi file")
+    parser.add_argument("--y-margin", type=float, default=12.0, help="Extra perpendicular half-width margin (px) around channel width profile (default: 12.0)")
     args = parser.parse_args()
 
     if not os.path.isfile(CALIB_FILE) or not os.path.isfile(BG_FILE):
@@ -539,6 +597,10 @@ def main():
         frames_to_run = min(frames_to_run, args.max_frames)
 
     print(f"\nProcessing {frames_to_run} frames (from frame {args.start_frame} of {total_frames}) at {fps} fps...")
+    corridor_mask = build_channel_corridor_mask(background.shape, width_profile, y_margin=args.y_margin)
+    if corridor_mask is not None:
+        active_pct = 100.0 * float(corridor_mask.mean())
+        print(f"Channel corridor mask active: {active_pct:.2f}% of frame area (y_margin=±{args.y_margin:.1f} px)")
 
     frame_count = 0
     for offset in range(frames_to_run):
@@ -548,8 +610,15 @@ def main():
             break
         frame_count += 1
 
-        # Detect cells
-        detections = detect_cells(frame, background, width_profile, verbose=(i % 1000 == 0))
+        # Detect cells (restricted to channel lumen + flare margin)
+        detections = detect_cells(
+            frame,
+            background,
+            width_profile,
+            y_margin=args.y_margin,
+            corridor_mask=corridor_mask,
+            verbose=(i % 1000 == 0)
+        )
 
         # Process with tracker
         results = tracker.process_frame(detections)

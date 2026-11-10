@@ -494,12 +494,13 @@ def compute_biomarker(track_path, width_profile, track_id=None):
     circs = [p[4] for p in track_path]
     positions = [(p[1], p[2]) for p in track_path]
 
-    # 1. Velocity (per frame displacement)
+    # 1. Velocity (per-frame displacement, properly divided by frame gap dt)
     velocities = []
     for i in range(1, len(positions)):
-        dx = positions[i][0] - positions[i-1][0]
-        dy = positions[i][1] - positions[i-1][1]
-        v = np.sqrt(dx**2 + dy**2)
+        dt = max(1, frames[i] - frames[i - 1])
+        dx = positions[i][0] - positions[i - 1][0]
+        dy = positions[i][1] - positions[i - 1][1]
+        v = np.sqrt(dx**2 + dy**2) / float(dt)
         velocities.append(v)
 
     if not velocities:
@@ -706,6 +707,21 @@ def main():
     print(f"\nResults saved to: {out_dir}")
     print(f"  - {len(all_biomarkers)} cell tracks")
     print(f"  - {len(all_trajectories)} frame-wise detections")
+    if all_biomarkers:
+        print(f"  - Mean velocity : {summary['metrics']['velocity_mean_px_per_frame']:.2f} px/frame")
+        print(f"  - Max velocity  : {summary['metrics']['velocity_max_px_per_frame']:.2f} px/frame")
+        print(f"  - Mean ADI      : {summary['metrics']['ADI_mean']:.3f}")
+        print(f"  - Mean Circ.    : {summary['metrics']['circularity_mean']:.3f}")
+        print("\nTop 10 Longest Cell Tracks:")
+        print(f"  {'ID':>4} | {'Frames':>6} | {'In->Out':>11} | {'VelMean':>7} | {'AreaMean':>8} | {'ADI':>5} | {'CircMean':>8}")
+        print("  " + "-" * 64)
+        top_tracks = sorted(all_biomarkers, key=lambda b: b["track_length_frames"], reverse=True)[:10]
+        for b in top_tracks:
+            span = f"{b['entrance_frame']}->{b['exit_frame']}"
+            print(
+                f"  {b['track_id']:4d} | {b['track_length_frames']:6d} | {span:>11} | "
+                f"{b['velocity_mean']:7.2f} | {b['area_mean']:8.1f} | {b['ADI']:5.3f} | {b['circularity_mean']:8.3f}"
+            )
     print(f"\nNext: Stage 4 (Testing + Deployment)")
 
 
